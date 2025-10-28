@@ -4,14 +4,28 @@
 
 void InitializeMemorySubsystem(unsigned int pmem_size) {
     // Step 1: Calculate total number of physical memory frames
+    kernel_state.total_frames = pmem_size / PAGESIZE;
     
     // Step 2: Allocate bitmap for tracking free or used frames
+    int bitmap_size = (kernel_state.total_frames + 7) / 8;
+    kernel_state.free_frame_bitmap = (unsigned long*)malloc(bitmap_size);
+    if (kernel_state.free_frame_bitmap == NULL) {
+        TracePrintf(0, "Failed to allocate frame bitmap\n");
+        Halt();
+    }
     
     // Step 3: Initialize all frames as free (set as 1)
+    memset(kernel_state.free_frame_bitmap, 0xFF, bitmap_size);
+    kernel_state.used_frames = 0;
     
     // Step 4: Build initial page table for Region 0
+    BuildInitialRegion0PageTable();
     
     // Step 5: Set initial kernel heap break pointer
+    kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+    
+    TracePrintf(1, "Memory subsystem initialized: %d frames, kernel brk at %p\n",
+                kernel_state.total_frames, kernel_brk);
 }
 
 void BuildInitialRegion0PageTable() {
