@@ -50,15 +50,15 @@ typedef struct KernelState {
     
     // Process management
     int next_pid;
+
+    // Kernel heap management
+    void* kernel_brk;              // Current kernel break
+    void* original_kernel_brk;     // Break at VM enable time
+    int vm_enabled;                // Virtual memory enabled flag
     
     // Terminal management
     struct terminal terminals[NUM_TERMINALS];
 } KernelState;
-
-// Global kernel state
-extern KernelState kernel_state;
-extern int vm_enabled;
-extern void* kernel_brk;
 
 // Function declarations
 void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt);
