@@ -80,10 +80,26 @@ PCB* CreateInitProcess(char* program, char** args) {
     if (init == NULL) return NULL;
     
     // Allocate kernel stack
+    init->kernel_stack_frames = AllocateKernelStackFrames();
+    if (init->kernel_stack_frames == NULL) {
+        FreePCB(init);
+        return NULL;
+    }
     
     // Use KernelContextSwitch to clone current process context
+    int rc = KernelContextSwitch(KCCopy, init, NULL);
+    if (rc == ERROR) {
+        TracePrintf(0, "Failed to clone process for init\n");
+        FreePCB(init);
+        return NULL;
+    }
     
     // Create empty Region 1 page table
+    init->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (init->region1_ptbr == NULL) {
+        FreePCB(init);
+        return NULL;
+    }
     
     // Load the executable into Region 1 (placeholder - would use LoadProgram)
     // if (LoadProgram(program, args, init) == ERROR) {
@@ -92,8 +108,14 @@ PCB* CreateInitProcess(char* program, char** args) {
     // }
     
     // Set up initial user context for init
+    init->user_context.sp = VMEM_1_LIMIT - sizeof(void*);
+    init->user_context.pc = (void*)VMEM_1_BASE;  // Start of program
     
     // Get PID
+    init->pid = helper_new_pid(init->region1_ptbr);
+    init->state = PROCESS_READY;
+    
+    TracePrintf(1, "Created init process PID %d\n", init->pid);
     return init;
 }
 
