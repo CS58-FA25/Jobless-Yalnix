@@ -14,13 +14,16 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
     // Initialize kernel globals
     memset(&kernel_state, 0, sizeof(KernelState));
+
+    // Initialize kernel heap tracking
+    kernel_state.original_kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+    kernel_state.kernel_brk = kernel_state.original_kernel_brk;
+    kernel_state.vm_enabled = 0;
+    
+    TracePrintf(1, "Initial kernel break: %p\n", kernel_state.kernel_brk);
     
     // Phase 1: Memory initialization
     InitializeMemorySubsystem(pmem_size);
-    
-    // Set initial kernel break using build-provided value
-    kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
-    TracePrintf(1, "Initial kernel break: %p\n", kernel_brk);
     
     // Phase 2: Enable virtual memory
     WriteRegister(REG_PTBRO, (unsigned int)kernel_state.region0_ptbr);
