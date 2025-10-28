@@ -4,9 +4,6 @@
 #include "traps.h"
 
 
-KernelState kernel_state;
-int vm_enabled = 0;
-void* kernel_brk = NULL;
 
 void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
