@@ -63,9 +63,48 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
 }
 
 int SetKernelBrk(void* addr) {
-    // Adjust the kernel break to the specified address
-    // Return 0 on success, -1 on failure
-    return 0;
+    if (addr == NULL) {
+        TracePrintf(0, "SetKernelBrk: NULL address\n");
+        return ERROR;
+    }
+    
+    // Round up to page boundary
+    void* new_brk = UP_TO_PAGE(addr);
+    
+    TracePrintf(2, "SetKernelBrk: requested %p, rounded to %p, current brk %p, VM enabled: %d\n",
+                addr, new_brk, kernel_state.kernel_brk, kernel_state.vm_enabled);
+    
+    // Check if we're shrinking the heap (typically not allowed)
+    if (new_brk < kernel_state.kernel_brk) {
+        TracePrintf(1, "SetKernelBrk: attempt to shrink kernel heap from %p to %p\n",
+                   kernel_state.kernel_brk, new_brk);
+        return ERROR;
+    }
+    
+    // If not growing, just update and return
+    if (new_brk == kernel_state.kernel_brk) {
+        return SUCCESS;
+    }
+    
+    if (!kernel_state.vm_enabled) {
+        // Pre-VM: Just track the new break value
+        // Validate that we're not growing beyond what we initially mapped
+        void* max_pre_vm_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+        
+        if (new_brk > max_pre_vm_brk) {
+            TracePrintf(0, "SetKernelBrk: pre-VM heap growth beyond initial mapping: %p > %p\n",
+                       new_brk, max_pre_vm_brk);
+            return ERROR;
+        }
+        
+        kernel_state.kernel_brk = new_brk;
+        TracePrintf(2, "SetKernelBrk: pre-VM update to %p\n", kernel_state.kernel_brk);
+        return SUCCESS;
+    }
+    
+    // Post-VM: Call memory.c to actually map the new pages
+    return GrowKernelHeap(new_brk);
+
 }
 
 // Keep the CPU busy when there's no other process to run
