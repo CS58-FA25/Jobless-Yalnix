@@ -39,15 +39,38 @@ PCB* CreateIdleProcess(UserContext* uctxt) {
     if (idle == NULL) return NULL;
     
     // Create Region 1 page table
-    
+    idle->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (idle->region1_ptbr == NULL) {
+        free(idle);
+        return NULL;
+    }
     // Set up user stack in Region 1 (one page)
-    
+    int user_stack_vpn = (VMEM_1_LIMIT - PAGESIZE - VMEM_1_BASE) >> PAGESHIFT;
+    int user_stack_pfn = AllocateFrame();
+    if (user_stack_pfn == ERROR) {
+        free(idle->region1_ptbr);
+        free(idle);
+        return NULL;
+    }
+
+    MapPage(idle->region1_ptbr, user_stack_vpn, user_stack_pfn, PROT_READ | PROT_WRITE);
     // Set up user context
-    
+    memcpy(&idle->user_context, uctxt, sizeof(UserContext));
+    idle->user_context.sp = VMEM_1_LIMIT - sizeof(void*);  // Top of user stack
+    idle->user_context.pc = (void*)DoIdle;
     // Allocate kernel stack
-    
+    idle->kernel_stack_frames = AllocateKernelStackFrames();
+    if (idle->kernel_stack_frames == NULL) {
+        FreeFrame(user_stack_pfn);
+        free(idle->region1_ptbr);
+        free(idle);
+        return NULL;
+    }
     // Get PID
+    idle->pid = helper_new_pid(idle->region1_ptbr);
+    idle->state = PROCESS_READY;
     
+    TracePrintf(1, "Created idle process PID %d\n", idle->pid);
     // Return the created idle process
     return idle;
 }
