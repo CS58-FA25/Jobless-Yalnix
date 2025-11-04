@@ -39,15 +39,38 @@ PCB* CreateIdleProcess(UserContext* uctxt) {
     if (idle == NULL) return NULL;
     
     // Create Region 1 page table
-    
+    idle->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (idle->region1_ptbr == NULL) {
+        free(idle);
+        return NULL;
+    }
     // Set up user stack in Region 1 (one page)
-    
+    int user_stack_vpn = (VMEM_1_LIMIT - PAGESIZE - VMEM_1_BASE) >> PAGESHIFT;
+    int user_stack_pfn = AllocateFrame();
+    if (user_stack_pfn == ERROR) {
+        free(idle->region1_ptbr);
+        free(idle);
+        return NULL;
+    }
+
+    MapPage(idle->region1_ptbr, user_stack_vpn, user_stack_pfn, PROT_READ | PROT_WRITE);
     // Set up user context
-    
+    memcpy(&idle->user_context, uctxt, sizeof(UserContext));
+    idle->user_context.sp = VMEM_1_LIMIT - sizeof(void*);  // Top of user stack
+    idle->user_context.pc = (void*)DoIdle;
     // Allocate kernel stack
-    
+    idle->kernel_stack_frames = AllocateKernelStackFrames();
+    if (idle->kernel_stack_frames == NULL) {
+        FreeFrame(user_stack_pfn);
+        free(idle->region1_ptbr);
+        free(idle);
+        return NULL;
+    }
     // Get PID
+    idle->pid = helper_new_pid(idle->region1_ptbr);
+    idle->state = PROCESS_READY;
     
+    TracePrintf(1, "Created idle process PID %d\n", idle->pid);
     // Return the created idle process
     return idle;
 }
@@ -57,10 +80,26 @@ PCB* CreateInitProcess(char* program, char** args) {
     if (init == NULL) return NULL;
     
     // Allocate kernel stack
+    init->kernel_stack_frames = AllocateKernelStackFrames();
+    if (init->kernel_stack_frames == NULL) {
+        FreePCB(init);
+        return NULL;
+    }
     
     // Use KernelContextSwitch to clone current process context
+    int rc = KernelContextSwitch(KCCopy, init, NULL);
+    if (rc == ERROR) {
+        TracePrintf(0, "Failed to clone process for init\n");
+        FreePCB(init);
+        return NULL;
+    }
     
     // Create empty Region 1 page table
+    init->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (init->region1_ptbr == NULL) {
+        FreePCB(init);
+        return NULL;
+    }
     
     // Load the executable into Region 1 (placeholder - would use LoadProgram)
     // if (LoadProgram(program, args, init) == ERROR) {
@@ -69,8 +108,14 @@ PCB* CreateInitProcess(char* program, char** args) {
     // }
     
     // Set up initial user context for init
+    init->user_context.sp = VMEM_1_LIMIT - sizeof(void*);
+    init->user_context.pc = (void*)VMEM_1_BASE;  // Start of program
     
     // Get PID
+    init->pid = helper_new_pid(init->region1_ptbr);
+    init->state = PROCESS_READY;
+    
+    TracePrintf(1, "Created init process PID %d\n", init->pid);
     return init;
 }
 
@@ -123,8 +168,11 @@ KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used) {
     PCB* new_pcb = (PCB*)new_pcb_p;
     
     // Copy kernel context
-    
+    memcpy(&new_pcb->kernel_context, kc_in, sizeof(KernelContext));
     // Copy kernel stack
+    CopyKernelStack(kernel_state.current_process, new_pcb);
+    
+    TracePrintf(2, "KCCopy: copied kernel context and stack to new process\n");
     
     return kc_in;
 }
@@ -134,9 +182,12 @@ KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p
     PCB* next_pcb = (PCB*)next_pcb_p;
     
     // Save current context
+    if (curr_pcb != NULL) {
+        memcpy(&curr_pcb->kernel_context, kc_in, sizeof(KernelContext));
+    }
     
     // Switch kernel stack mapping
-    
+    SwitchKernelStackMapping(next_pcb);
     // Return new context
     return &next_pcb->kernel_context;
 }
