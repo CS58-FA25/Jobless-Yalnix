@@ -26,6 +26,7 @@ void UnmapPage(pte_t* page_table, int vpn);
 int IsPageMapped(pte_t* page_table, int vpn);
 pte_t* CreateEmptyPageTable(int num_pages);
 pte_t* CopyPageTable(pte_t* src, int num_pages);
+void CopyKernelStack(PCB* src, PCB* dest);
 void SwitchKernelStackMapping(PCB* pcb);
 
 // TLB management
