@@ -168,8 +168,11 @@ KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used) {
     PCB* new_pcb = (PCB*)new_pcb_p;
     
     // Copy kernel context
-    
+    memcpy(&new_pcb->kernel_context, kc_in, sizeof(KernelContext));
     // Copy kernel stack
+    CopyKernelStack(kernel_state.current_process, new_pcb);
+    
+    TracePrintf(2, "KCCopy: copied kernel context and stack to new process\n");
     
     return kc_in;
 }
@@ -179,9 +182,12 @@ KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p
     PCB* next_pcb = (PCB*)next_pcb_p;
     
     // Save current context
+    if (curr_pcb != NULL) {
+        memcpy(&curr_pcb->kernel_context, kc_in, sizeof(KernelContext));
+    }
     
     // Switch kernel stack mapping
-    
+    SwitchKernelStackMapping(next_pcb);
     // Return new context
     return &next_pcb->kernel_context;
 }
