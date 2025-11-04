@@ -231,6 +231,81 @@ void FreeKernelStackFrames(int* frames) {
     free(frames);
 }
 
+void CopyKernelStack(PCB* src, PCB* dest) {
+    if (src == NULL || dest == NULL) {
+        TracePrintf(0, "CopyKernelStack: NULL PCB\n");
+        return;
+    }
+    
+    TracePrintf(2, "CopyKernelStack: copying from PID %d to new process\n", src->pid);
+    
+    // Find kernel stack VPN in Region 0
+    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
+    int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
+    
+    // Save current kernel stack mappings
+    pte_t saved_ptes[num_frames];
+    int current_kstack_frames[num_frames];
+ 
+    for (int i = 0; i < num_frames; i++) {
+        int vpn = kernel_stack_vpn + i;
+        saved_ptes[i] = kernel_state.region0_ptbr[vpn];
+        
+        // Get current process's kernel stack frames
+        if (src->kernel_stack_frames[i] != ERROR) {
+            current_kstack_frames[i] = src->kernel_stack_frames[i];
+        } else {
+            current_kstack_frames[i] = ERROR;
+        }
+    }
+    
+    // Temporarily map source process's kernel stack for reading
+    for (int i = 0; i < num_frames; i++) {
+        int vpn = kernel_stack_vpn + i;
+        if (current_kstack_frames[i] != ERROR) {
+            kernel_state.region0_ptbr[vpn].valid = 1;
+            kernel_state.region0_ptbr[vpn].pfn = current_kstack_frames[i];
+            kernel_state.region0_ptbr[vpn].prot = PROT_READ;
+        }
+    }
+    
+    // Flush TLB to apply new mappings
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
+    
+    // Read from source kernel stack
+    void* src_stack_base = (void*)KERNEL_STACK_BASE;
+    
+    // Temporarily map destination process's kernel stack for writing
+    for (int i = 0; i < num_frames; i++) {
+        int vpn = kernel_stack_vpn + i;
+        if (dest->kernel_stack_frames[i] != ERROR) {
+            kernel_state.region0_ptbr[vpn].valid = 1;
+            kernel_state.region0_ptbr[vpn].pfn = dest->kernel_stack_frames[i];
+            kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        }
+    }
+    
+    // Flush TLB again to apply destination mappings
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
+    
+    // Write to destination kernel stack
+    void* dest_stack_base = (void*)KERNEL_STACK_BASE;
+    memcpy(dest_stack_base, src_stack_base, KERNEL_STACK_MAXSIZE);
+    
+    TracePrintf(2, "Copied %d bytes of kernel stack\n", KERNEL_STACK_MAXSIZE);
+    
+    // Restore original kernel stack mappings
+    for (int i = 0; i < num_frames; i++) {
+        int vpn = kernel_stack_vpn + i;
+        kernel_state.region0_ptbr[vpn] = saved_ptes[i];
+    }
+    
+    // Final TLB flush to restore original state
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
+    
+    TracePrintf(1, "CopyKernelStack: completed successfully\n");
+}
+
 void SwitchKernelStackMapping(PCB* pcb) {
     // Step 1: Calculate kernel stack virtual page number
     if (pcb == NULL) return;
