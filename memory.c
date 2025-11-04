@@ -233,10 +233,27 @@ void FreeKernelStackFrames(int* frames) {
 
 void SwitchKernelStackMapping(PCB* pcb) {
     // Step 1: Calculate kernel stack virtual page number
+    if (pcb == NULL) return;
+    
+    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
+    int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
     
     // Step 2: Map new process's kernel stack frames into kernel page table
+    for (int i = 0; i < num_frames; i++) {
+        int vpn = kernel_stack_vpn + i;
+        if (pcb->kernel_stack_frames[i] != ERROR) {
+            kernel_state.region0_ptbr[vpn].valid = 1;
+            kernel_state.region0_ptbr[vpn].pfn = pcb->kernel_stack_frames[i];
+            kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        } else {
+            kernel_state.region0_ptbr[vpn].valid = 0;
+        }
+    }
    
     // Step 3: Flush TLB entries for kernel stack region to avoid stale mappings
+    
+    //Not used in checkpoint3
+    //WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
 }
 
 void FlushTLBEntry(void* vaddr) {
