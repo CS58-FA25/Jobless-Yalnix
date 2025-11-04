@@ -104,6 +104,11 @@ pte_t* CreateEmptyPageTable(int num_pages) {
     if (page_table == NULL) return NULL;
     
     // Step 2: Initialize all entries as invalid/unmapped
+    for (int i = 0; i < num_pages; i++) {
+        page_table[i].valid = 0;
+        page_table[i].pfn = 0;
+        page_table[i].prot = 0;
+    }
     
     return page_table;
 }
@@ -114,7 +119,16 @@ pte_t* CopyPageTable(pte_t* src, int num_pages) {
     if (dest == NULL) return NULL;
     
     // Step 2: Copy valid mappings from source to destination
-    
+    for (int i = 0; i < num_pages; i++) {
+        if (src[i].valid) {
+            dest[i].valid = 1;
+            dest[i].pfn = src[i].pfn;
+            dest[i].prot = src[i].prot;
+            
+            // Mark frame as used (in real implementation, use reference counting)
+            MarkFrameUsed(src[i].pfn);
+        }
+    }
     
     return dest;
 }
@@ -137,19 +151,40 @@ int AllocateFrame() {
     // Step 1: Search for first free frame in the bitmap
         // Step 2: Mark frame as used and update counters
         // Return allocated frame number
-    return pfn;
+    for (int pfn = 0; pfn < kernel_state.total_frames; pfn++) {
+        if (IsFrameFree(pfn)) {
+            MarkFrameUsed(pfn);
+            kernel_state.used_frames++;
+            TracePrintf(3, "Allocated frame %d, used: %d/%d\n",
+                       pfn, kernel_state.used_frames, kernel_state.total_frames);
+            return pfn;
+        }
+    }
+    
     // Step 3: No free frames available, then out of memory
+    TracePrintf(0, "No free frames available! Used: %d/%d\n",
+               kernel_state.used_frames, kernel_state.total_frames);
     return ERROR;
 }
 
 void FreeFrame(int pfn) {
     // Validate frame number and mark as free
+    if (pfn >= 0 && pfn < kernel_state.total_frames) {
+        MarkFrameFree(pfn);
+        kernel_state.used_frames--;
+        TracePrintf(3, "Freed frame %d, used: %d/%d\n",
+                   pfn, kernel_state.used_frames, kernel_state.total_frames);
+    }
 }
 
 // Bitmap operations for frame tracking
 int IsFrameFree(int pfn) {
     
     // Step 1: Calculate byte and bit position in bitmap
+    if (pfn < 0 || pfn >= kernel_state.total_frames) return 0;
+
+    int byte_index = pfn / 8;
+    int bit_index = pfn % 8;
     
     // Step 2: Check if the corresponding bit is set
     return (kernel_state.free_frame_bitmap[byte_index] >> bit_index) & 1;
@@ -174,6 +209,17 @@ int* AllocateKernelStackFrames() {
     if (frames == NULL) return NULL;
     
     // Step 2: Allocate physical frames for kernel stack
+    for (int i = 0; i < num_frames; i++) {
+        frames[i] = AllocateFrame();
+        if (frames[i] == ERROR) {
+            // Clean up already allocated frames
+            for (int j = 0; j < i; j++) {
+                FreeFrame(frames[j]);
+            }
+            free(frames);
+            return NULL;
+        }
+    }
     
     return frames;
 }
