@@ -123,3 +123,9 @@ $(USER_APPS): $(USER_OBJS) $(USER_INCS)  $(USER_LIBS)
 
 %: %.o $(USER_LIBS)
 	$(LINK_USER) -o $@ $*.o $(USER_LDFLAGS)
+
+USER_SRCS = user/init.c
+USER_OBJS = $(USER_SRCS:%.c=build/%.o)
+
+user: build-dirs $(USER_OBJS)
+	$(CC) -o user/init $(USER_OBJS) -L$(YALNIX_FRAMEWORK)/lib -lyuser -static
