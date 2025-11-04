@@ -4,24 +4,98 @@
 
 void InitializeMemorySubsystem(unsigned int pmem_size) {
     // Step 1: Calculate total number of physical memory frames
+    kernel_state.total_frames = pmem_size / PAGESIZE;
     
     // Step 2: Allocate bitmap for tracking free or used frames
+    int bitmap_size = (kernel_state.total_frames + 7) / 8;
+    kernel_state.free_frame_bitmap = (unsigned long*)malloc(bitmap_size);
+    if (kernel_state.free_frame_bitmap == NULL) {
+        TracePrintf(0, "Failed to allocate frame bitmap\n");
+        Halt();
+    }
     
     // Step 3: Initialize all frames as free (set as 1)
+    memset(kernel_state.free_frame_bitmap, 0xFF, bitmap_size);
+    kernel_state.used_frames = 0;
     
     // Step 4: Build initial page table for Region 0
+    BuildInitialRegion0PageTable();
     
     // Step 5: Set initial kernel heap break pointer
+    kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+    
+    TracePrintf(1, "Memory subsystem initialized: %d frames, kernel brk at %p\n",
+                kernel_state.total_frames, kernel_brk);
 }
 
 void BuildInitialRegion0PageTable() {
+    void BuildInitialRegion0PageTable() {
     // Step 1: Allocate memory for Region 0 page table entries
+    kernel_state.region0_ptlr = VMEM_0_SIZE / PAGESIZE;
+    kernel_state.region0_ptbr = (pte_t*)malloc(kernel_state.region0_ptlr * sizeof(pte_t));
+    if (kernel_state.region0_ptbr == NULL) {
+        TracePrintf(0, "Failed to allocate Region 0 page table\n");
+        Halt();
+    }
+    
+    // Get build-provided values from yalnix.h
+    int first_kernel_text_page = GET_FIRST_KERNEL_TEXT_PAGE();
+    int first_kernel_data_page = GET_FIRST_KERNEL_DATA_PAGE(); 
+    int orig_kernel_brk_page = GET_ORIG_KERNEL_BRK_PAGE();
+    
+    TracePrintf(1, "Kernel pages: text=%d, data=%d, brk=%d\n",
+                first_kernel_text_page, first_kernel_data_page, orig_kernel_brk_page);
     
     // Step 2: Initialize all page table entries as invalid
-    
+    for (int vpn = 0; vpn < kernel_state.region0_ptlr; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 0;
+        kernel_state.region0_ptbr[vpn].pfn = 0;
+        kernel_state.region0_ptbr[vpn].prot = 0;
+    }
+
     // Step 3: Create identity mapping for kernel text, data, and heap regions
+    // Map kernel text region (read-only, executable)
+    for (int vpn = first_kernel_text_page; vpn < first_kernel_data_page; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  // Identity mapping
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_EXEC;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel text: VPN %d -> PFN %d (READ|EXEC)\n", vpn, vpn);
+    }
     
+    // Map kernel data/heap region (read-write)
+    for (int vpn = first_kernel_data_page; vpn < orig_kernel_brk_page; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  // Identity mapping
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel data: VPN %d -> PFN %d (READ|WRITE)\n", vpn, vpn);
+    }
+
     // Step 4: Map kernel virtual pages to same physical frames
+    // Set up kernel stack area (initially unmapped - will be mapped per-process)
+    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
+    int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
+    
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 0;  // Unmapped initially
+        TracePrintf(2, "Kernel stack page %d (VPN %d) initially unmapped\n", 
+                   i, kernel_stack_vpn + i);
+    }
+    
+    // Set up red zone below kernel stack (unmapped to catch stack overflows)
+    int red_zone_vpn = kernel_stack_vpn - 1;
+    kernel_state.region0_ptbr[red_zone_vpn].valid = 0;
+    TracePrintf(2, "Red zone at VPN %d (unmapped)\n", red_zone_vpn);
+    
+    TracePrintf(1, "Region 0 page table complete:\n");
+    TracePrintf(1, "  - Text:   VPN [%d, %d) -> READ|EXEC\n", 
+                first_kernel_text_page, first_kernel_data_page);
+    TracePrintf(1, "  - Data:   VPN [%d, %d) -> READ|WRITE\n", 
+                first_kernel_data_page, orig_kernel_brk_page);
+    TracePrintf(1, "  - Stack:  VPN [%d, %d) -> per-process mapping\n",
+                kernel_stack_vpn, kernel_stack_vpn + kernel_stack_pages);
+}
 }
 
 pte_t* CreateEmptyPageTable(int num_pages) {
@@ -172,3 +246,4 @@ int GrowKernelHeap(void* addr) {
     // Placeholder for kernel heap growth implementation
     return SUCCESS;
 }
+
