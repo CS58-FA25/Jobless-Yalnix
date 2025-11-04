@@ -112,3 +112,75 @@ void HandleTrapMemory(UserContext* uctxt) {
        
     // If HandleMemoryTrap returns ERROR, the process may be terminated
 }
+
+void SyscallGetPid(UserContext* uctxt) {
+    // GetPid has no arguments, just returns the current process ID
+    uctxt->regs[0] = kernel_state.current_process->pid;
+    TracePrintf(2, "GetPid: returning PID %d\n", uctxt->regs[0]);
+}
+
+void SyscallDelay(UserContext* uctxt) {
+    int clock_ticks = uctxt->regs[0];  
+    
+    TracePrintf(2, "Delay: process %d delaying for %d ticks\n", 
+                kernel_state.current_process->pid, clock_ticks);
+    
+    // Validate argument
+    if (clock_ticks < 0) {
+        uctxt->regs[0] = ERROR;
+        TracePrintf(0, "Delay: invalid tick count %d\n", clock_ticks);
+        return;
+    }
+    
+    // If delay is 0, return immediately
+    if (clock_ticks == 0) {
+        uctxt->regs[0] = SUCCESS;
+        return;
+    }
+    
+    // Set up delay tracking in PCB
+    PCB* current = kernel_state.current_process;
+    current->delay_remaining = clock_ticks;
+    current->state = PROCESS_BLOCKED;
+    
+    // Add to delay queue (you'll need to implement this)
+    AddToDelayQueue(current);
+    
+    TracePrintf(1, "Delay: process %d blocked for %d ticks\n", 
+                current->pid, clock_ticks);
+    
+    // Schedule another process
+    Schedule();
+    
+    // When we resume, the delay has completed
+    uctxt->regs[0] = SUCCESS;
+}
+
+void SyscallBrk(UserContext* uctxt) {
+    void* addr = (void*)uctxt->regs[0];  // First argument
+    PCB* current = kernel_state.current_process;
+    
+    TracePrintf(2, "Brk: process %d requesting brk at %p\n", 
+                current->pid, addr);
+    
+    // Validate address is in Region 1
+    if (addr < VMEM_1_BASE || addr >= VMEM_1_LIMIT) {
+        uctxt->regs[0] = ERROR;
+        TracePrintf(0, "Brk: address %p outside Region 1\n", addr);
+        return;
+    }
+    
+    // Round up to page boundary
+    void* new_brk = UP_TO_PAGE(addr);
+    
+    // Handle the brk request
+    int result = GrowUserHeap(current, new_brk);
+    uctxt->regs[0] = result;
+    
+    if (result == SUCCESS) {
+        TracePrintf(1, "Brk: process %d heap now ends at %p\n", 
+                    current->pid, current->user_heap_break);
+    } else {
+        TracePrintf(0, "Brk: failed to grow heap to %p\n", new_brk);
+    }
+}
