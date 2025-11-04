@@ -326,9 +326,7 @@ void SwitchKernelStackMapping(PCB* pcb) {
     }
    
     // Step 3: Flush TLB entries for kernel stack region to avoid stale mappings
-    
-    //Not used in checkpoint3
-    //WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
 }
 
 void FlushTLBEntry(void* vaddr) {
