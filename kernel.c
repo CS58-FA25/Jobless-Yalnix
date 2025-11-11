@@ -1,7 +1,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
-#include "traps.h"
+#include "trap.h"
 
 
 
