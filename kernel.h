@@ -35,6 +35,7 @@ typedef struct PCB {
 typedef struct KernelState {
     PCB* current_process;
     PCB* ready_queue;
+    PCB* delay_queue;
     PCB* idle_process;
     PCB* init_process;
     PCB* zombie_list;

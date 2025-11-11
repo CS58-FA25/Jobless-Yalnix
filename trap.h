@@ -6,6 +6,9 @@
 // Global interrupt vector table
 extern void (*interrupt_vector_table[TRAP_VECTOR_SIZE])(UserContext*);
 
+// Initialization
+void InitializeInterruptVectorTable(void);
+
 // Trap handlers
 void HandleTrapKernel(UserContext* uctxt);
 void HandleTrapClock(UserContext* uctxt);
