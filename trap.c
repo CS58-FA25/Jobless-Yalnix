@@ -65,12 +65,15 @@ void HandleTrapKernel(UserContext* uctxt) {
             break;
     }
     // Step 4: Restore updated user context before returning to user mode
-    RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+    if(kernel_state.current_process->state == PROCESS_RUNNING){
+        RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+    }
 }
 
 void HandleTrapClock(UserContext* uctxt) {
     // Step 1: Save current process context
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
+    
     // Step 2: If current process is valid running process, move to ready queue
     PCB* current = kernel_state.current_process;
     if (current->state == PROCESS_RUNNING) {
