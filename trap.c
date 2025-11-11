@@ -556,7 +556,7 @@ void SyscallTtyWrite(UserContext* uctxt) {
             uctxt->regs[0] = ERROR;
             return;
         }
-        kernel_buf[i] = ((char)buf + i);
+        kernel_buf[i] = ((char*)buf[i];
     }
     
     // Start transmission
