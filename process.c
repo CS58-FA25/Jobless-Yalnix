@@ -163,6 +163,26 @@ void AddToReadyQueue(PCB* pcb) {
     TracePrintf(2, "Added process %d to ready queue\n", pcb->pid);
 }
 
+void AddToDelayQueue(PCB* pcb) {
+    if (pcb == NULL) return;
+    
+    // Add the PCB to the delay queue
+    pcb->next = NULL;
+    
+    if (kernel_state.delay_queue == NULL) {
+        kernel_state.delay_queue = pcb;
+    } else {
+        PCB* current = kernel_state.delay_queue;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = pcb;
+    }
+    
+    TracePrintf(2, "Added process %d to delay queue for %d ticks\n", 
+                pcb->pid, pcb->delay_remaining);
+}
+
 PCB* RemoveFromReadyQueue() {
     // Remove and return the first PCB from the ready queue
     PCB* pcb = kernel_state.ready_queue;
