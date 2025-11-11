@@ -11,6 +11,7 @@ PCB* FindPCB(int pid);
 void AddChildProcess(PCB* parent, PCB* child);
 void RemoveChildProcess(PCB* parent, PCB* child);
 void OrphanChildren(PCB* parent);
+PCB* FindZombieChild(PCB* parent);
 
 // Scheduling
 void Schedule();
