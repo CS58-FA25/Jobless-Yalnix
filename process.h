@@ -15,7 +15,6 @@ void OrphanChildren(PCB* parent);
 // Scheduling
 void Schedule();
 void Dispatch(PCB* next_process);
-void YieldCPU();
 
 // Context management
 void SaveUserContext(UserContext* dest, UserContext* src);
