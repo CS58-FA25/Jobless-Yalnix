@@ -117,14 +117,19 @@ pte_t* CopyPageTable(pte_t* src, int num_pages) {
     if (dest == NULL) return NULL;
     
     // Step 2: Copy valid mappings from source to destination
-    for (int i = 0; i < num_pages; i++) {
-        if (src[i].valid) {
-            dest[i].valid = 1;
-            dest[i].pfn = src[i].pfn;
-            dest[i].prot = src[i].prot;
+    for (int vpn = 0; vpn < num_pages; vpn++) {
+        if (src[vpn].valid) {
+            // For fork(), we need to copy-on-write or duplicate the frame
+            // For now, implement copy-on-write by marking both pages as read-only
+            dest[vpn].valid = 1;
+            dest[vpn].pfn = src[vpn].pfn;  // Share the same frame
+            dest[vpn].prot = PROT_READ;     // Mark as read-only for CoW
             
-            // Mark frame as used (in real implementation, use reference counting)
-            MarkFrameUsed(src[i].pfn);
+            // Mark source as read-only too
+            src[vpn].prot = PROT_READ;
+            
+            TracePrintf(2, "Copied mapping: VPN %d -> PFN %d (READ-ONLY for CoW)\n", 
+                        vpn, src[vpn].pfn);
         }
     }
     
@@ -415,13 +420,92 @@ int GrowUserStack(PCB* pcb, void* fault_addr) {
 }
 
 int GrowUserHeap(PCB* pcb, void* addr) {
-    // Placeholder for user heap growth implementation
-    // Would map pages between current heap break and new address
+    if (pcb == NULL || addr == NULL) return ERROR;
+    
+    // Round up to page boundary
+    void* new_brk = UP_TO_PAGE(addr);
+    void* current_brk = pcb->user_heap_break;
+    
+    TracePrintf(2, "GrowUserHeap: process %d, current brk %p, new brk %p\n",
+                pcb->pid, current_brk, new_brk);
+    
+    // Check if we're shrinking (not typically allowed)
+    if (new_brk < current_brk) {
+        TracePrintf(0, "GrowUserHeap: attempt to shrink user heap\n");
+        return ERROR;
+
+    // Check if new break would collide with stack
+    if (new_brk >= pcb->user_context.sp) {
+        TracePrintf(0, "GrowUserHeap: heap would grow into stack\n");
+        return ERROR;
+    }
+    
+    // Map pages between current break and new break
+    int current_vpn = ((unsigned int)current_brk - VMEM_1_BASE) >> PAGESHIFT;
+    int new_vpn = ((unsigned int)new_brk - VMEM_1_BASE) >> PAGESHIFT;
+    
+    for (int vpn = current_vpn; vpn < new_vpn; vpn++) {
+        int pfn = AllocateFrame();
+        if (pfn == ERROR) {
+            TracePrintf(0, "GrowUserHeap: out of memory at VPN %d\n", vpn);
+            // Clean up any pages we already allocated
+            for (int i = current_vpn; i < vpn; i++) {
+                UnmapPage(pcb->region1_ptbr, i);
+            }
+            return ERROR;
+        }
+        
+        MapPage(pcb->region1_ptbr, vpn, pfn, PROT_READ | PROT_WRITE);
+        TracePrintf(2, "Mapped user heap page: VPN %d -> PFN %d\n", vpn, pfn);
+    }
+    
+    // Update user heap break
+    pcb->user_heap_break = new_brk;
+    
+    // Flush TLB for the new mappings
+    FlushRegion1TLB();
+    
     return SUCCESS;
 }
 
 int GrowKernelHeap(void* addr) {
-    // Placeholder for kernel heap growth implementation
+    if (addr == NULL) return ERROR;
+    
+    // Round up to page boundary
+    void* new_brk = UP_TO_PAGE(addr);
+    void* current_brk = kernel_state.kernel_brk;
+    
+    TracePrintf(2, "GrowKernelHeap: current brk %p, new brk %p\n",
+                current_brk, new_brk);
+    
+    // Check if we're shrinking (not typically allowed)
+    if (new_brk < current_brk) {
+        TracePrintf(0, "GrowKernelHeap: attempt to shrink kernel heap\n");
+        return ERROR;
+    }
+    
+    // Map pages between current break and new break in Region 0
+    int current_vpn = ((unsigned int)current_brk - VMEM_0_BASE) >> PAGESHIFT;
+    int new_vpn = ((unsigned int)new_brk - VMEM_0_BASE) >> PAGESHIFT;
+    
+    for (int vpn = current_vpn; vpn < new_vpn; vpn++) {
+        int pfn = AllocateFrame();
+        if (pfn == ERROR) {
+            TracePrintf(0, "GrowKernelHeap: out of memory at VPN %d\n", vpn);
+            // Clean up any pages we already allocated
+            for (int i = current_vpn; i < vpn; i++) {
+                UnmapPage(kernel_state.region0_ptbr, i);
+            }
+            return ERROR;
+        }
+        
+        MapPage(kernel_state.region0_ptbr, vpn, pfn, PROT_READ | PROT_WRITE);
+        TracePrintf(2, "Mapped kernel heap page: VPN %d -> PFN %d\n", vpn, pfn);
+    }
+    
+    // Update kernel heap break
+    kernel_state.kernel_brk = new_brk;
+    
     return SUCCESS;
 }
 
