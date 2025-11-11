@@ -1,4 +1,3 @@
-We have finished the initialization of the Kernel including KernelContextSwitch/Copy, create init PCB for processing, basic memory allocation, and several system calls (brk, delay, getpid).
+We have finished most of the checkpoint4 contents, like syscall: fork, exec and wait
 
-We also insert loadprogram.c and Makefile into the checkpoint3.
-
+Also, we change and add a lot of functions in both 4 c file
