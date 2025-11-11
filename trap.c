@@ -1,7 +1,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
-#include "traps.h"
+#include "trap.h"
 
 // Global interrupt vector table which stores function pointers for all trap handlers
 void (*interrupt_vector_table[TRAP_VECTOR_SIZE])(UserContext*);
