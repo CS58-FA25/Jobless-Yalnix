@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
+#include "trap.h"
 
 PCB* CreatePCB() {
     // Allocate and initialize a new PCB
