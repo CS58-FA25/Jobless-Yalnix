@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
+#include "trap.h"
 
 void InitializeMemorySubsystem(unsigned int pmem_size) {
     // Step 1: Calculate total number of physical memory frames
