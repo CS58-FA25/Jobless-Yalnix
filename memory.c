@@ -433,7 +433,7 @@ int GrowUserHeap(PCB* pcb, void* addr) {
     if (new_brk < current_brk) {
         TracePrintf(0, "GrowUserHeap: attempt to shrink user heap\n");
         return ERROR;
-
+    }
     // Check if new break would collide with stack
     if (new_brk >= pcb->user_context.sp) {
         TracePrintf(0, "GrowUserHeap: heap would grow into stack\n");
