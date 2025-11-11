@@ -11,6 +11,7 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
     // Initialize kernel globals
     memset(&kernel_state, 0, sizeof(KernelState));
+    kernel_state.next_pid = 0;
 
     // Initialize kernel heap tracking
     kernel_state.original_kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
@@ -42,6 +43,7 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
     kernel_state.current_process = kernel_state.idle_process;
     kernel_state.ready_queue = kernel_state.idle_process;
+    AddToReadyQueue(kernel_state.idle_process);  // Ensure in queue
     
     // Phase 5: Create init process
     char* init_program = (cmd_args[0] != NULL) ? cmd_args[0] : "init";
@@ -51,12 +53,14 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
         TracePrintf(0, "Failed to create init process, halting\n");
         Halt();
     }
+    AddToReadyQueue(kernel_state.init_process);
     
     TracePrintf(1, "Leaving KernelStart, starting scheduler\n");
     
     // Return to user mode (idle process)
     SaveUserContext(uctxt, &kernel_state.current_process->user_context);
     SetupProcessMemoryMapping(kernel_state.current_process);
+    RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
 }
 
 int SetKernelBrk(void* addr) {
