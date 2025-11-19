@@ -101,4 +101,7 @@ void InitializeInterruptVectorTable();
 void SetupProcessMemoryMapping(PCB* pcb);
 void DoIdle(void);
 
+// Load program
+int LoadProgram(char* filename, char** args, PCB* pcb);
+
 #endif
