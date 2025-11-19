@@ -9,9 +9,6 @@
 #define PROCESS_BLOCKED   2
 #define PROCESS_ZOMBIE    3
 
-// Error codes
-#define ERROR -1
-#define SUCCESS 0
 
 // Process Control Block
 typedef struct PCB {
@@ -48,7 +45,12 @@ typedef struct KernelState {
     // Page tables
     pte_t* region0_ptbr;
     int region0_ptlr;
-    
+
+    // Kernel heap management
+    void* kernel_brk;              // Current kernel break
+    void* original_kernel_brk;     // Break at VM enable time
+    int vm_enabled;                // Virtual memory enabled flag
+
     // Process management
     int next_pid;
     
@@ -58,8 +60,8 @@ typedef struct KernelState {
 
 // Global kernel state
 extern KernelState kernel_state;
-extern int vm_enabled;
-extern void* kernel_brk;
+
+extern unsigned long GET_ORIG_KERNEL_BRK_PAGE(void);
 
 // Function declarations
 void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt);
