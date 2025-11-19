@@ -19,15 +19,17 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     kernel_state.vm_enabled = 0;
     
     TracePrintf(1, "Initial kernel break: %p\n", kernel_state.kernel_brk);
-    
+
+    // Phase 0:Terminal initialization
+    InitializationTerminals();
     // Phase 1: Memory initialization
     InitializeMemorySubsystem(pmem_size);
     
     // Phase 2: Enable virtual memory
-    WriteRegister(REG_PTBRO, (unsigned int)kernel_state.region0_ptbr);
-    WriteRegister(REG_PTLRO, kernel_state.region0_ptlr);
+    WriteRegister(REG_PTBR0, (unsigned int)kernel_state.region0_ptbr);
+    WriteRegister(REG_PTLR0, kernel_state.region0_ptlr);
     WriteRegister(REG_VM_ENABLE, 1);
-    vm_enabled = 1;
+    kernel_state.vm_enabled = 1;
     TracePrintf(1, "Virtual memory enabled\n");
 
     // Phase 3: Interrupt system
