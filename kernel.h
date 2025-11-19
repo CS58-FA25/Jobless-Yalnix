@@ -55,7 +55,7 @@ typedef struct KernelState {
     int next_pid;
     
     // Terminal management
-    struct terminal terminals[NUM_TERMINALS];
+    TtyState* terminals[NUM_TERMINALS];
 } KernelState;
 
 // Global kernel state
