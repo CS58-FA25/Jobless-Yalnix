@@ -2,7 +2,7 @@
 #include "memory.h"
 #include "process.h"
 #include "trap.h"
-
+#include "terminal.h"
 
 
 void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
