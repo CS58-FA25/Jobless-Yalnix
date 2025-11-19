@@ -129,8 +129,9 @@ PCB* CreateInitProcess(char* program, char** args) {
     
     // Load the executable into Region 1 (placeholder - would use LoadProgram)
     if (LoadProgram(program, args, init) == ERROR) {
-         FreePCB(init);
-         return NULL;
+        TracePrintf(0, "Failed to load program %s\n", program);
+        FreePCB(init);
+        return NULL;
     }
     
     // Set up initial user context for init
