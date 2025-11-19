@@ -6,9 +6,6 @@
 // Global interrupt vector table which stores function pointers for all trap handlers
 void (*interrupt_vector_table[TRAP_VECTOR_SIZE])(UserContext*);
 
-#define UP_TO_PAGE(addr) ((((unsigned long)(addr) + PAGESIZE - 1) / PAGESIZE) * PAGESIZE)
-#define DOWN_TO_PAGE(addr) (((unsigned long)(addr) / PAGESIZE) * PAGESIZE)
-
 void InitializeInterruptVectorTable() {
     // Step 1: Set all entries to default handler as fallback
     for (int i = 0; i < TRAP_VECTOR_SIZE; i++) {
