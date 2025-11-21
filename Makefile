@@ -9,18 +9,20 @@
 
 
 # Where's your kernel source?
-K_SRC_DIR = .
+K_SRC_DIR = ./src
+K_INC_DIR = ./inc
 
 # What are the kernel c and include files? 
-K_SRCS = kernelstart.c memory.c process.c Queue.c syscalls.c trap.c idle.c re1sp.c re0sp.c kernelbrk.c template.c init.c
-K_INCS = memory.h process.h Queue.h syscalls.h trap.h idle.h init.h
+K_SRCS = kernel.c memory.c process.c trap.c loadprogram.c
+K_INCS = kernel.h memory.h process.h trap.h
 
 # Where's your user source?
-U_SRC_DIR = .
+U_SRC_DIR = ./src
+U_INC_DIR = ./inc
 
 # What are the user c and include files?
-U_SRCS = user.c 
-U_INCS =  
+U_SRCS = init.c idle.c
+U_INCS = kernel.h memory.h process.h trap.h
 
 
 #==========================================================
@@ -35,14 +37,14 @@ KERNEL_ALL = yalnix
 # Automatically generate the list of sources, objects, and includes for the kernek
 KERNEL_SRCS = $(K_SRCS:%=$(K_SRC_DIR)/%)
 KERNEL_OBJS = $(KERNEL_SRCS:%.c=%.o) 
-KERNEL_INCS = $(K_INCS:%=$(K_SRC_DIR)/%) 
+KERNEL_INCS = $(K_INCS:%=$(K_INC_DIR)/%) 
 
 
 # Automatically generate the list of apps, sources, objects, and includes for your userland coden
 USER_SRCS = $(U_SRCS:%=$(U_SRC_DIR)/%)
 USER_OBJS = $(USER_SRCS:%.c=%.o)
 USER_APPS = $(USER_SRCS:%.c=%)
-USER_INCS = $(U_INCS:%=$(U_SRC_DIR)/%) 
+USER_INCS = $(U_INCS:%=$(U_INC_DIR)/%) 
 
 #write to output program yalnix
 YALNIX_OUTPUT = yalnix
@@ -83,7 +85,7 @@ LINK_USER = $(LINK.c) $(USER_CFLAGS) $(USER_LINK_FLAGS)
 
 USER_LIBS = $(LIBDIR)/libyuser.a
 ASFLAGS = -D__ASM__
-CPPFLAGS=  -D_FILE_OFFSET_BITS=64 -m32 -fno-builtin -I. -I$(INCDIR) -g -DLINUX -fno-stack-protector
+CPPFLAGS=  -D_FILE_OFFSET_BITS=64 -m32 -fno-builtin -I. -I./inc -I$(INCDIR) -g -DLINUX -fno-stack-protector
 
 
 ##########################
@@ -129,3 +131,4 @@ USER_OBJS = $(USER_SRCS:%.c=build/%.o)
 
 user: build-dirs $(USER_OBJS)
 	$(CC) -o user/init $(USER_OBJS) -L$(YALNIX_FRAMEWORK)/lib -lyuser -static
+
