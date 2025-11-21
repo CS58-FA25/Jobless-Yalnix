@@ -3,6 +3,61 @@
 #include "process.h"
 #include "trap.h"
 
+static TempMapping temp_mappings[MAX_TEMP_MAPPINGS];
+
+void InitializeTempMappings(void) {
+    for (int i = 0; i < MAX_TEMP_MAPPINGS; i++) {
+        temp_mappings[i].active = 0;
+    }
+}
+
+void* MapFrameTemporary(int pfn, int prot, int slot) {
+    if (slot < 0 || slot >= MAX_TEMP_MAPPINGS) {
+        TracePrintf(0, "MapFrameTemporary: invalid slot %d\n", slot);
+        return NULL;
+    }
+    
+    if (temp_mappings[slot].active) {
+        TracePrintf(0, "MapFrameTemporary: slot %d already active!\n", slot);
+        return NULL;
+    }
+    
+    // Use different VPNs for different slots
+    int temp_vpn = 124 + slot; // VPN 124 and 125
+    
+    // Save original mapping
+    temp_mappings[slot].saved_mapping = kernel_state.region0_ptbr[temp_vpn];
+    temp_mappings[slot].vpn = temp_vpn;
+    
+    // Map the frame temporarily
+    kernel_state.region0_ptbr[temp_vpn].valid = 1;
+    kernel_state.region0_ptbr[temp_vpn].pfn = pfn;
+    kernel_state.region0_ptbr[temp_vpn].prot = prot;
+    
+    // Flush TLB for the temporary mapping
+    FlushTLBEntry((void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT)));
+    
+    temp_mappings[slot].active = 1;
+    
+    return (void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT));
+}
+
+void UnmapFrameTemporary(int slot) {
+    if (slot < 0 || slot >= MAX_TEMP_MAPPINGS || !temp_mappings[slot].active) {
+        return;
+    }
+    
+    int temp_vpn = temp_mappings[slot].vpn;
+    
+    // Restore original mapping
+    kernel_state.region0_ptbr[temp_vpn] = temp_mappings[slot].saved_mapping;
+    
+    // Flush TLB again
+    FlushTLBEntry((void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT)));
+    
+    temp_mappings[slot].active = 0;
+}
+
 void InitializeMemorySubsystem(unsigned int pmem_size) {
     // Step 1: Calculate total number of physical memory frames
     kernel_state.total_frames = pmem_size / PAGESIZE;
@@ -19,14 +74,27 @@ void InitializeMemorySubsystem(unsigned int pmem_size) {
     memset(kernel_state.free_frame_bitmap, 0xFF, bitmap_size);
     kernel_state.used_frames = 0;
     
+    // Reserve low frames (bootloader/hardware reserved)
+    MarkKernelFramesAsUsed();
+
     // Step 4: Build initial page table for Region 0
     BuildInitialRegion0PageTable();
     
     // Step 5: Set initial kernel heap break pointer
-    kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+    kernel_state.kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
     
+    InitializeTempMappings();
+
     TracePrintf(1, "Memory subsystem initialized: %d frames, kernel brk at %p\n",
-                kernel_state.total_frames, kernel_brk);
+                kernel_state.total_frames, kernel_state.kernel_brk);
+}
+
+void MarkKernelFramesAsUsed() {
+    int first_text_pfn = GET_FIRST_KERNEL_TEXT_PAGE();  // e.g., 16
+    for (int pfn = 0; pfn < first_text_pfn; pfn++) {
+        MarkFrameUsed(pfn);  // Sets bit in bitmap, increments used_frames
+    }
+    TracePrintf(1, "Marked %d low PFNs (0–%d) as used (reserved)\n", first_text_pfn, first_text_pfn - 1);
 }
 
 void BuildInitialRegion0PageTable() {
@@ -73,17 +141,22 @@ void BuildInitialRegion0PageTable() {
     }
 
     // Step 4: Map kernel virtual pages to same physical frames
-    // Set up kernel stack area (initially unmapped - will be mapped per-process)
     int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
     int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
     
+    TracePrintf(1, "Mapping initial kernel stack: VPN [%d, %d)\n", 
+                kernel_stack_vpn, kernel_stack_vpn + kernel_stack_pages);
+    
     for (int i = 0; i < kernel_stack_pages; i++) {
-        kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 0;  // Unmapped initially
-        TracePrintf(2, "Kernel stack page %d (VPN %d) initially unmapped\n", 
-                   i, kernel_stack_vpn + i);
+        int vpn = kernel_stack_vpn + i;
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel stack: VPN %d -> PFN %d (READ|WRITE)\n", vpn, vpn);
     }
     
-    // Set up red zone below kernel stack (unmapped to catch stack overflows)
+    // Step 5: set up red zone below kernel stack (unmapped to catch stack overflows)
     int red_zone_vpn = kernel_stack_vpn - 1;
     kernel_state.region0_ptbr[red_zone_vpn].valid = 0;
     TracePrintf(2, "Red zone at VPN %d (unmapped)\n", red_zone_vpn);
@@ -93,8 +166,22 @@ void BuildInitialRegion0PageTable() {
                 first_kernel_text_page, first_kernel_data_page);
     TracePrintf(1, "  - Data:   VPN [%d, %d) -> READ|WRITE\n", 
                 first_kernel_data_page, orig_kernel_brk_page);
-    TracePrintf(1, "  - Stack:  VPN [%d, %d) -> per-process mapping\n",
+    TracePrintf(1, "  - Stack:  VPN [%d, %d) -> READ|WRITE\n",
                 kernel_stack_vpn, kernel_stack_vpn + kernel_stack_pages);
+    
+    TracePrintf(1, "Verifying kernel stack mappings:\n");
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        int vpn = kernel_stack_vpn + i;
+        TracePrintf(1, "  VPN %d: valid=%d, pfn=%d, prot=0x%x\n",
+                   vpn, kernel_state.region0_ptbr[vpn].valid,
+                   kernel_state.region0_ptbr[vpn].pfn,
+                   kernel_state.region0_ptbr[vpn].prot);
+    }
+
+    for (int i = 124; i <= 125; i++) {
+        kernel_state.region0_ptbr[i].valid = 0;
+        TracePrintf(2, "Reserved VPN %d for temporary mappings\n", i);
+    }
 }
 
 pte_t* CreateEmptyPageTable(int num_pages) {
@@ -229,12 +316,11 @@ void MarkFrameFree(int pfn) {
 }
 
 int* AllocateKernelStackFrames() {
-    // Step 1: Calculate number of frames needed for kernel stack
     int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
     int* frames = (int*)malloc(num_frames * sizeof(int));
     if (frames == NULL) return NULL;
     
-    // Step 2: Allocate physical frames for kernel stack
+    // Allocate and initialize each frame
     for (int i = 0; i < num_frames; i++) {
         frames[i] = AllocateFrame();
         if (frames[i] == ERROR) {
@@ -244,6 +330,13 @@ int* AllocateKernelStackFrames() {
             }
             free(frames);
             return NULL;
+        }
+        
+        // Initialize the frame to zeros using temporary mapping
+        void* temp_addr = MapFrameTemporary(frames[i], PROT_READ | PROT_WRITE, 0);
+        if (temp_addr != NULL) {
+            memset(temp_addr, 0, PAGESIZE);
+            UnmapFrameTemporary(0);
         }
     }
     
@@ -271,70 +364,43 @@ void CopyKernelStack(PCB* src, PCB* dest) {
         return;
     }
     
-    TracePrintf(2, "CopyKernelStack: copying from PID %d to new process\n", src->pid);
+    TracePrintf(2, "CopyKernelStack: copying from PID %d to PID %d\n", src->pid, dest->pid);
     
-    // Find kernel stack VPN in Region 0
+    // Since we're running in kernel mode, we can directly access the kernel stack
+    int kernel_stack_size = KERNEL_STACK_MAXSIZE;
+    void* src_stack = (void*)KERNEL_STACK_BASE;
+    
+    // Map destination frames temporarily and copy
     int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
-    int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
+    int kernel_stack_pages = kernel_stack_size / PAGESIZE;
     
     // Save current kernel stack mappings
-    pte_t saved_ptes[num_frames];
-    int current_kstack_frames[num_frames];
- 
-    for (int i = 0; i < num_frames; i++) {
-        int vpn = kernel_stack_vpn + i;
-        saved_ptes[i] = kernel_state.region0_ptbr[vpn];
-        
-        // Get current process's kernel stack frames
-        if (src->kernel_stack_frames[i] != ERROR) {
-            current_kstack_frames[i] = src->kernel_stack_frames[i];
-        } else {
-            current_kstack_frames[i] = ERROR;
-        }
+    pte_t saved_mappings[kernel_stack_pages];
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        saved_mappings[i] = kernel_state.region0_ptbr[kernel_stack_vpn + i];
     }
     
-    // Temporarily map source process's kernel stack for reading
-    for (int i = 0; i < num_frames; i++) {
-        int vpn = kernel_stack_vpn + i;
-        if (current_kstack_frames[i] != ERROR) {
-            kernel_state.region0_ptbr[vpn].valid = 1;
-            kernel_state.region0_ptbr[vpn].pfn = current_kstack_frames[i];
-            kernel_state.region0_ptbr[vpn].prot = PROT_READ;
+    // Temporarily map destination frames
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        if (dest->kernel_stack_frames[i] != ERROR) {
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 1;
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].pfn = dest->kernel_stack_frames[i];
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].prot = PROT_READ | PROT_WRITE;
         }
     }
     
     // Flush TLB to apply new mappings
     WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
     
-    // Read from source kernel stack
-    void* src_stack_base = (void*)KERNEL_STACK_BASE;
+    // Copy the stack contents
+    memcpy((void*)KERNEL_STACK_BASE, src_stack, kernel_stack_size);
     
-    // Temporarily map destination process's kernel stack for writing
-    for (int i = 0; i < num_frames; i++) {
-        int vpn = kernel_stack_vpn + i;
-        if (dest->kernel_stack_frames[i] != ERROR) {
-            kernel_state.region0_ptbr[vpn].valid = 1;
-            kernel_state.region0_ptbr[vpn].pfn = dest->kernel_stack_frames[i];
-            kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
-        }
+    // Restore original mappings
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        kernel_state.region0_ptbr[kernel_stack_vpn + i] = saved_mappings[i];
     }
     
-    // Flush TLB again to apply destination mappings
-    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
-    
-    // Write to destination kernel stack
-    void* dest_stack_base = (void*)KERNEL_STACK_BASE;
-    memcpy(dest_stack_base, src_stack_base, KERNEL_STACK_MAXSIZE);
-    
-    TracePrintf(2, "Copied %d bytes of kernel stack\n", KERNEL_STACK_MAXSIZE);
-    
-    // Restore original kernel stack mappings
-    for (int i = 0; i < num_frames; i++) {
-        int vpn = kernel_stack_vpn + i;
-        kernel_state.region0_ptbr[vpn] = saved_ptes[i];
-    }
-    
-    // Final TLB flush to restore original state
+    // Flush TLB again
     WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
     
     TracePrintf(1, "CopyKernelStack: completed successfully\n");
@@ -346,7 +412,7 @@ void SwitchKernelStackMapping(PCB* pcb) {
     // Step 1: Calculate kernel stack virtual page number
     int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
     int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
-    
+
     // Step 2: Map new process's kernel stack frames into kernel page table
     for (int i = 0; i < kernel_stack_pages; i++) {
         if (pcb->kernel_stack_frames[i] != ERROR) {
@@ -424,7 +490,7 @@ int GrowUserHeap(PCB* pcb, void* addr) {
     if (pcb == NULL || addr == NULL) return ERROR;
     
     // Round up to page boundary
-    void* new_brk = UP_TO_PAGE(addr);
+    void* new_brk = (void*)UP_TO_PAGE(addr);
     void* current_brk = pcb->user_heap_break;
     
     TracePrintf(2, "GrowUserHeap: process %d, current brk %p, new brk %p\n",
@@ -473,7 +539,7 @@ int GrowKernelHeap(void* addr) {
     if (addr == NULL) return ERROR;
     
     // Round up to page boundary
-    void* new_brk = UP_TO_PAGE(addr);
+    void* new_brk = (void*)UP_TO_PAGE(addr);
     void* current_brk = kernel_state.kernel_brk;
     
     TracePrintf(2, "GrowKernelHeap: current brk %p, new brk %p\n",
@@ -509,4 +575,6 @@ int GrowKernelHeap(void* addr) {
     
     return SUCCESS;
 }
+
+
 
