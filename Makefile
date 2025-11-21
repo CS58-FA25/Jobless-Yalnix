@@ -9,18 +9,20 @@
 
 
 # Where's your kernel source?
-K_SRC_DIR = .
+K_SRC_DIR = ./src
+K_INC_DIR = ./inc
 
 # What are the kernel c and include files? 
-K_SRCS = kernelstart.c memory.c process.c Queue.c syscalls.c trap.c idle.c re1sp.c re0sp.c kernelbrk.c template.c init.c
-K_INCS = memory.h process.h Queue.h syscalls.h trap.h idle.h init.h
+K_SRCS = kernel.c memory.c process.c trap.c loadprogram.c
+K_INCS = kernel.h memory.h process.h trap.h
 
 # Where's your user source?
-U_SRC_DIR = .
+U_SRC_DIR = ./src
+U_INC_DIR = ./inc
 
 # What are the user c and include files?
-U_SRCS = user.c 
-U_INCS =  
+U_SRCS = init.c
+U_INCS = kernel.h memory.h process.h trap.h
 
 
 #==========================================================
