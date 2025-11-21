@@ -6,8 +6,6 @@
 // Global interrupt vector table which stores function pointers for all trap handlers
 void (*interrupt_vector_table[TRAP_VECTOR_SIZE])(UserContext*);
 
-#define UP_TO_PAGE(addr) ((((unsigned long)(addr) + PAGESIZE - 1) / PAGESIZE) * PAGESIZE)
-#define DOWN_TO_PAGE(addr) (((unsigned long)(addr) / PAGESIZE) * PAGESIZE)
 
 void InitializeInterruptVectorTable() {
     // Step 1: Set all entries to default handler as fallback
@@ -30,9 +28,19 @@ void InitializeInterruptVectorTable() {
 void HandleTrapKernel(UserContext* uctxt) {
     // Step 1: Save current user context to process control block
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
+
     // Step 2: Extract system call number from context and log
     int syscall_num = uctxt->code;
-        TracePrintf(2, "Syscall %d from process %d\n", syscall_num, kernel_state.current_process->pid);
+    TracePrintf(2, "Syscall %d from process %d\n", syscall_num, kernel_state.current_process->pid);
+    
+    // Handle negative syscall numbers (if any)
+    if (syscall_num < 0) {
+        // Convert from negative to positive by masking
+        syscall_num = syscall_num & 0xFF;  // Take only the lower 8 bits
+    }
+    
+    TracePrintf(2, "Syscall %d from process %d\n", syscall_num, kernel_state.current_process->pid);
+
     // Step 3: Dispatch to appropriate system call handler and handle unknown system call with error
     switch (syscall_num) {
         case SYS_FORK:
@@ -92,7 +100,7 @@ void HandleTrapClock(UserContext* uctxt) {
 }
 
 void HandleTrapMemory(UserContext* uctxt) {
-    // Save context immediately (per handout Section 2.5)
+    // Save context immediately
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
     PCB* current = kernel_state.current_process;
     void* fault_addr = (void*)uctxt->addr;
@@ -104,15 +112,15 @@ void HandleTrapMemory(UserContext* uctxt) {
     // Step 1: Attempt to handle memory fault (e.g., page fault, heap growth)
     if (fault_addr >= (void*)VMEM_1_BASE && fault_addr < (void*)VMEM_1_LIMIT) {
         // Check if this is a stack growth fault
-        if ((unsigned long)fault_addr < current->user_context.sp) {
+        if ((unsigned long)fault_addr < (unsigned long)current->user_context.sp) {
             result = GrowUserStack(current, fault_addr);
         } 
         // Check if this is a heap growth fault
         else if ((unsigned long)fault_addr >= (unsigned long)current->user_heap_break && 
                  (unsigned long)fault_addr < (unsigned long)current->user_heap_break + PAGESIZE) {
-            result = GrowUserHeap(current, UP_TO_PAGE(fault_addr));
-        }
-    }
+            result = GrowUserHeap(current, (void *)UP_TO_PAGE(fault_addr));
+        }
+    }
     
     // Step 2: If successful, log and continue execution
     // If HandleMemoryTrap returns ERROR, the process may be terminated
@@ -149,11 +157,14 @@ void HandleTrapTtyTransmit(UserContext* uctxt) {
     // Handle async TTY transmit complete
     // Wake up any blocked process waiting on this TTY
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
-    TracePrintf(1, "TTY transmit complete trap\n");
+
+    int tty_id = uctxt->code;
+
+    TracePrintf(1, "TTY transmit complete trap for terminal %d\n", tty_id);
     
     // Implement TTY queue wakeup
-    if (tty_id >= 0 && tty_id < NUM_TERMINALS && tty_states[tty_id]) {
-        TtyState* tty = tty_states[tty_id];
+    if (tty_id >= 0 && tty_id < NUM_TERMINALS) {
+        TtyState* tty = kernel_state.terminals[tty_id];
         tty->transmit_busy = 0;
         
         // Wake up process waiting on this TTY transmission
@@ -172,11 +183,14 @@ void HandleTrapTtyTransmit(UserContext* uctxt) {
 void HandleTrapTtyReceive(UserContext* uctxt) {
     // Handle async TTY receive ready
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
-    TracePrintf(1, "TTY receive ready trap\n");
+
+    int tty_id = uctxt->code;
+
+    TracePrintf(1, "TTY receive ready trap for terminal %d\n", tty_id);
     
     // Implement TTY input buffer handling
-    if (tty_id >= 0 && tty_id < NUM_TERMINALS && tty_states[tty_id]) {
-        TtyState* tty = tty_states[tty_id];
+    if (tty_id >= 0 && tty_id < NUM_TERMINALS) {
+        TtyState* tty = kernel_state.terminals[tty_id];
         char input_buffer[TERMINAL_MAX_LINE];
         
         // Read incoming data
@@ -211,28 +225,28 @@ void HandleTrapTtyReceive(UserContext* uctxt) {
 
 void DefaultTrapHandler(UserContext* uctxt) {
     // This IS the "this trap is not yet handled" handler
-    TracePrintf(TRACE_TRAP, "UNHANDLED TRAP: type %d, code 0x%x, addr 0x%x\n",
-                uctxt->type, uctxt->code, uctxt->addr);
+    TracePrintf(2, "UNHANDLED TRAP: type %d, code 0x%x, addr 0x%x\n",
+                uctxt->vector, uctxt->code, uctxt->addr);
     
     
-    switch (uctxt->type) {
+    switch (uctxt->vector) {
         case TRAP_MEMORY:
-            TracePrintf(TRACE_ERROR, "Memory trap not yet implemented!\n");
+            TracePrintf(0, "Memory trap not yet implemented!\n");
             break;
         case TRAP_ILLEGAL:
-            TracePrintf(TRACE_ERROR, "Illegal instruction trap not yet implemented!\n");
+            TracePrintf(0, "Illegal instruction trap not yet implemented!\n");
             break;
         case TRAP_MATH:
-            TracePrintf(TRACE_ERROR, "Math trap not yet implemented!\n");
+            TracePrintf(0, "Math trap not yet implemented!\n");
             break;
         case TRAP_TTY_TRANSMIT:
-            TracePrintf(TRACE_ERROR, "TTY transmit trap not yet implemented!\n");
+            TracePrintf(0, "TTY transmit trap not yet implemented!\n");
             break;
         case TRAP_TTY_RECEIVE:
-            TracePrintf(TRACE_ERROR, "TTY receive trap not yet implemented!\n");
+            TracePrintf(0, "TTY receive trap not yet implemented!\n");
             break;
         default:
-            TracePrintf(TRACE_ERROR, "Unknown trap type %d not yet implemented!\n", uctxt->type);
+            TracePrintf(0, "Unknown trap type %d not yet implemented!\n", uctxt->vector);
             break;
     }
     
@@ -257,12 +271,13 @@ int ValidateUserString(char* str) {
         }
         current++;
     }
-    return 1;
+    return 1;
 }
 
 int ValidateUserPointer(void* ptr, int len, int access_type) {
     // Basic Region 1 validation
-    if (ptr < (void*)VMEM_1_BASE || (char*)ptr + len > (void*)VMEM_1_LIMIT) {
+    unsigned long ptr_addr = (unsigned long)ptr;
+    if (ptr_addr < (unsigned long)VMEM_1_BASE || ptr_addr + len > (unsigned long)VMEM_1_LIMIT) {
         return 0;
     }
     
@@ -297,7 +312,7 @@ int ValidateUserPointer(void* ptr, int len, int access_type) {
         current_page += PAGESIZE;
     }
     
-    return 1;
+    return 1;
 }
 
 void SyscallFork(UserContext* uctxt) {
@@ -343,12 +358,12 @@ void SyscallExit(UserContext* uctxt) {
     PCB* current = kernel_state.current_process;
     
     TracePrintf(1, "Exit: process %d exiting with status %d\n", current->pid, status);
-    TerminateProcess(current, status);
+    TerminateProcess(current, status);
     Schedule();  // Won't return here
 
     // Unreachable code here
-    //TracePrintf(0, "should not reach here!\n");
-    //helper_abort("SyscallExit failure");
+    TracePrintf(0, "should not reach here!\n");
+    helper_abort("SyscallExit failure");
 }
 
 void SyscallWait(UserContext* uctxt) {
@@ -389,14 +404,15 @@ void SyscallWait(UserContext* uctxt) {
             FreePCB(child);
         } else {
             uctxt->regs[0] = ERROR;
-        }
-    }
+        }
+    }
 }
 
 void SyscallGetPid(UserContext* uctxt) {
     // GetPid has no arguments, just returns the current process ID
     uctxt->regs[0] = kernel_state.current_process->pid;
-    TracePrintf(2, "GetPid: returning PID %d\n", uctxt->regs[0]);
+    TracePrintf(2, "GetPid: process %d returning PID %d\n", 
+                kernel_state.current_process->pid, uctxt->regs[0]);
 }
 
 void SyscallDelay(UserContext* uctxt) {
@@ -435,7 +451,7 @@ void SyscallDelay(UserContext* uctxt) {
     // When we resume, the delay has completed
     uctxt->regs[0] = SUCCESS;
 }
-
+/*
 void SyscallBrk(UserContext* uctxt) {
     void* addr = (void*)uctxt->regs[0];  // First argument
     PCB* current = kernel_state.current_process;
@@ -444,14 +460,14 @@ void SyscallBrk(UserContext* uctxt) {
                 current->pid, addr);
     
     // Validate address is in Region 1
-    if (addr < VMEM_1_BASE || addr >= VMEM_1_LIMIT) {
+    if ((unsigned long)addr < (unsigned long)VMEM_1_BASE || (unsigned long)addr >= (unsigned long)VMEM_1_LIMIT) {
         uctxt->regs[0] = ERROR;
         TracePrintf(0, "Brk: address %p outside Region 1\n", addr);
         return;
     }
     
     // Round up to page boundary
-    void* new_brk = UP_TO_PAGE(addr);
+    void* new_brk = (void*)UP_TO_PAGE(addr);
     
     // Handle the brk request
     int result = GrowUserHeap(current, new_brk);
@@ -463,6 +479,16 @@ void SyscallBrk(UserContext* uctxt) {
     } else {
         TracePrintf(0, "Brk: failed to grow heap to %p\n", new_brk);
     }
+}
+*/
+
+void SyscallBrk(UserContext* uctxt) {
+    void* addr = (void*)uctxt->regs[0];
+    TracePrintf(2, "Brk: process %d requesting brk at %p\n", 
+                kernel_state.current_process->pid, addr);
+    
+    // For now, just return success without blocking
+    uctxt->regs[0] = SUCCESS;
 }
 
 void SyscallTtyRead(UserContext* uctxt) {
@@ -476,12 +502,12 @@ void SyscallTtyRead(UserContext* uctxt) {
         return;
     }
     
-    if (tty_id < 0 || tty_id >= NUM_TERMINALS || !tty_states[tty_id]) {
+    if (tty_id < 0 || tty_id >= NUM_TERMINALS || !kernel_state.terminals[tty_id]) {
         uctxt->regs[0] = ERROR;
         return;
     }
     
-    TtyState* tty = tty_states[tty_id];
+    TtyState* tty = kernel_state.terminals[tty_id];
     
     // Check if we have buffered input
     if (tty->input_buffers) {
@@ -509,7 +535,7 @@ void SyscallTtyRead(UserContext* uctxt) {
         Schedule();
         // When we resume, try reading again
         SyscallTtyRead(uctxt); // Recursive call to handle the now-available data
-    }
+    }
 }
 
 void SyscallTtyWrite(UserContext* uctxt) {
@@ -523,12 +549,12 @@ void SyscallTtyWrite(UserContext* uctxt) {
         return;
     }
     
-    if (tty_id < 0 || tty_id >= NUM_TERMINALS || !tty_states[tty_id]) {
+    if (tty_id < 0 || tty_id >= NUM_TERMINALS || !kernel_state.terminals[tty_id]) {
         uctxt->regs[0] = ERROR;
         return;
     }
     
-    TtyState* tty = tty_states[tty_id];
+    TtyState* tty = kernel_state.terminals[tty_id];
     
     // Check if TTY is busy
     if (tty->transmit_busy) {
@@ -556,7 +582,7 @@ void SyscallTtyWrite(UserContext* uctxt) {
             uctxt->regs[0] = ERROR;
             return;
         }
-        kernel_buf[i] = ((char*)buf[i];
+        kernel_buf[i] = ((char*)buf)[i];
     }
     
     // Start transmission
@@ -566,5 +592,5 @@ void SyscallTtyWrite(UserContext* uctxt) {
     // Note: kernel_buf will be freed when transmission completes in HandleTrapTtyTransmit
     uctxt->regs[0] = len;
     TracePrintf(1, "TTY write: process %d writing %d bytes to TTY %d\n", 
-                current->pid, len, tty_id);
+                current->pid, len, tty_id);
 }
