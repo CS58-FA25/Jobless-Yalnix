@@ -39,6 +39,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
     long segment_size;
     char *argbuf;
 
+
     /*
      * Open the executable file 
      */
@@ -241,36 +242,62 @@ int LoadProgram(char *name, char *args[], PCB* proc)
      * Read the text from the file into memory.
      */
     lseek(fd, li.t_faddr, SEEK_SET);
-    segment_size = li.t_npg << PAGESHIFT;
     
     for (int i = 0; i < li.t_npg; i++) {
         int pfn = proc->region1_ptbr[text_pg1 + i].pfn;
-        char* page_data = (char*)(pfn << PAGESHIFT);
-        int bytes_to_read = PAGESIZE;
-        if (read(fd, page_data, bytes_to_read) != bytes_to_read) {
+        
+        // Save current mapping at temp location
+        pte_t saved_pte = kernel_state.region0_ptbr[TEMP_PAGE_VPN];
+        
+        // Map the physical frame temporarily
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].valid = 1;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].pfn = pfn;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].prot = PROT_READ | PROT_WRITE;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
+        
+        // Access via virtual address
+        char* page_data = (char*)((TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
+        
+        if (read(fd, page_data, PAGESIZE) != PAGESIZE) {
             TracePrintf(0, "LoadProgram: failed to read text segment\n");
+            kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
             free(argbuf);
             close(fd);
             return ERROR;
         }
+        
+        // Restore mapping
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
     }
 
     /*
      * Read the data from the file into memory.
      */
     lseek(fd, li.id_faddr, 0);
-    segment_size = li.id_npg << PAGESHIFT;
 
     for (int i = 0; i < li.id_npg; i++) {
         int pfn = proc->region1_ptbr[data_pg1 + i].pfn;
-        char* page_data = (char*)(pfn << PAGESHIFT);
-        int bytes_to_read = PAGESIZE;
-        if (read(fd, page_data, bytes_to_read) != bytes_to_read) {
+        
+        pte_t saved_pte = kernel_state.region0_ptbr[TEMP_PAGE_VPN];
+        
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].valid = 1;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].pfn = pfn;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].prot = PROT_READ | PROT_WRITE;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
+        
+        char* page_data = (char*)((TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
+        
+        if (read(fd, page_data, PAGESIZE) != PAGESIZE) {
             TracePrintf(0, "LoadProgram: failed to read data segment\n");
+            kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
             free(argbuf);
             close(fd);
             return ERROR;
         }
+        
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
     }
 
     close(fd);			/* we've read it all now */
@@ -296,8 +323,19 @@ int LoadProgram(char *name, char *args[], PCB* proc)
      */
     for (int i = li.id_npg; i < data_npg; i++) {
         int pfn = proc->region1_ptbr[data_pg1 + i].pfn;
-        char* page_data = (char*)(pfn << PAGESHIFT);
+        
+        pte_t saved_pte = kernel_state.region0_ptbr[TEMP_PAGE_VPN];
+        
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].valid = 1;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].pfn = pfn;
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN].prot = PROT_READ | PROT_WRITE;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
+        
+        char* page_data = (char*)((TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
         memset(page_data, 0, PAGESIZE);
+        
+        kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
+        WriteRegister(REG_TLB_FLUSH, (TEMP_PAGE_VPN << PAGESHIFT) + VMEM_0_BASE);
     }
 
     /*
@@ -326,3 +364,4 @@ int LoadProgram(char *name, char *args[], PCB* proc)
 
     return SUCCESS;
 }
+
