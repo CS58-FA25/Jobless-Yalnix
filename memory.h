@@ -3,6 +3,14 @@
 
 #include <ykernel.h>
 
+#define MAX_TEMP_MAPPINGS 2
+
+typedef struct {
+    int active;
+    pte_t saved_mapping;
+    int vpn;
+} TempMapping;
+
 // Memory management functions
 void InitializeMemorySubsystem(unsigned int pmem_size);
 void BuildInitialRegion0PageTable();
@@ -37,5 +45,14 @@ void FlushAllTLB();
 // Kernel stack management
 int* AllocateKernelStackFrames();
 void FreeKernelStackFrames(int* frames);
+
+// Temporary frame mapping (for loading programs, etc.)
+void* MapFrameTemporary(int pfn, int prot, int slot);
+void UnmapFrameTemporary(int slot);
+void InitializeTempMappings(void);
+
+// Temporary page VPNs for mapping
+#define TEMP_PAGE_VPN ((KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT) - 1
+#define TEMP_PAGE_VPN_2 ((KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT) - 2
 
 #endif
