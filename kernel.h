@@ -9,9 +9,7 @@
 #define PROCESS_BLOCKED   2
 #define PROCESS_ZOMBIE    3
 
-// Error codes
-#define ERROR -1
-#define SUCCESS 0
+
 
 // Process Control Block
 typedef struct PCB {
@@ -29,7 +27,28 @@ typedef struct PCB {
     int state;
     int exit_status;
     int is_zombie;
+    int waiting_for_child;
+    int delay_remaining;
 } PCB;
+
+// TTY buffer for storing input lines
+typedef struct TtyBuffer {
+    char buffer[TERMINAL_MAX_LINE];
+    int length;
+    int read_pos;
+    int write_pos;
+    struct TtyBuffer* next;
+} TtyBuffer;
+
+// TTY state structure
+typedef struct TtyState {
+    int transmit_busy;           // Whether TTY is currently transmitting
+    PCB* transmit_waiting;       // Process waiting for transmit completion
+    PCB* read_waiting;           // Process waiting for input
+    TtyBuffer* input_buffers;    // Linked list of input buffers
+    char* transmit_buffer;       // Current transmit buffer
+    int transmit_length;         // Current transmit length
+} TtyState;
 
 // Kernel global state
 typedef struct KernelState {
@@ -48,18 +67,39 @@ typedef struct KernelState {
     // Page tables
     pte_t* region0_ptbr;
     int region0_ptlr;
+
+    // Kernel heap management
+    void* kernel_brk;              // Current kernel break
+    void* original_kernel_brk;     // Break at VM enable time
+    int vm_enabled;                // Virtual memory enabled flag
     
     // Process management
     int next_pid;
     
     // Terminal management
-    struct terminal terminals[NUM_TERMINALS];
+    TtyState* terminals[NUM_TERMINALS];
 } KernelState;
 
 // Global kernel state
 extern KernelState kernel_state;
-extern int vm_enabled;
-extern void* kernel_brk;
+
+// Build-provided functions from yalnix.h
+/*
+extern int _first_kernel_text_page;
+extern int _first_kernel_data_page;
+extern int _orig_kernel_brk_page;
+extern unsigned long GET_ORIG_KERNEL_BRK_PAGE(void);
+extern int GET_FIRST_KERNEL_TEXT_PAGE(void);
+extern int GET_FIRST_KERNEL_DATA_PAGE(void);
+*/
+
+extern int _orig_kernel_brk_page;
+#define GET_ORIG_KERNEL_BRK_PAGE() (_orig_kernel_brk_page)
+extern int _first_kernel_text_page;  
+#define GET_FIRST_KERNEL_TEXT_PAGE() (_first_kernel_text_page)
+extern int _first_kernel_data_page;
+#define GET_FIRST_KERNEL_DATA_PAGE() (_first_kernel_data_page)
+
 
 // Function declarations
 void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt);
@@ -94,9 +134,17 @@ void CopyKernelStack(PCB* src, PCB* dest);
 KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used);
 KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p);
 
+// Terminal management functions
+void InitializeTerminals(void);
+TtyState* GetTerminalState(int tty_id);
+int ValidateTerminalId(int tty_id);
+
 // Helper functions
 void InitializeInterruptVectorTable();
 void SetupProcessMemoryMapping(PCB* pcb);
 void DoIdle(void);
+
+// Load program
+int LoadProgram(char *program, char **args, PCB *init_pcb);
 
 #endif
