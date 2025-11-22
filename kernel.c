@@ -13,7 +13,15 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
     // Initialize kernel globals
     memset(&kernel_state, 0, sizeof(KernelState));
-    kernel_state.next_pid = 0;
+
+    // Initialize all queues
+    kernel_state.ready_queue = NULL;
+    kernel_state.delay_queue = NULL;      // ADD THIS
+    kernel_state.zombie_list = NULL;      // ADD THIS
+    kernel_state.current_process = NULL;
+    kernel_state.idle_process = NULL;
+    kernel_state.init_process = NULL;
+    kernel_state.ready_queue_tail = NULL;
 
     // Initialize kernel heap tracking
     kernel_state.original_kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
@@ -24,7 +32,6 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     
     // Phase 1: Memory initialization
     InitializeMemorySubsystem(pmem_size);
-    
     BuildInitialRegion0PageTable();
     TracePrintf(1, "Region 0 page table built\n");
 
@@ -48,42 +55,41 @@ void KernelStart(char* cmd_args[], unsigned int pmem_size, UserContext* uctxt) {
     InitializeInterruptVectorTable();
     WriteRegister(REG_VECTOR_BASE, (unsigned int)interrupt_vector_table);
     
-    // Phase 4: Create init process
-    char* init_program = (cmd_args[0] != NULL) ? cmd_args[0] : "init";
-    PCB* init_process = CreateInitProcess(init_program, cmd_args);
-    
-    if (init_process == NULL) {
-        TracePrintf(0, "Failed to create init process, halting\n");
+    char* init_program = (cmd_args[0] != NULL) ? cmd_args[0] : "src/init";
+    char* idle_program = (cmd_args[1] != NULL) ? cmd_args[1] : "src/idle";
+
+    char* init_args[] = {init_program, NULL};
+    char* idle_args[] = {idle_program, NULL};
+
+    // Phase 4: Create idle process FIRST
+    kernel_state.idle_process = CreateIdleProcess(idle_program, idle_args);
+    if (kernel_state.idle_process == NULL) {
+        TracePrintf(0, "Failed to create idle process\n");
         Halt();
     }
+    TracePrintf(1, "Created idle process PID %d\n", kernel_state.idle_process->pid);
 
-    // Set init as current process
-    kernel_state.current_process = init_process;
-    init_process->state = PROCESS_RUNNING;
-
-    TracePrintf(1, "Created init process PID %d\n", init_process->pid);
-    TracePrintf(1, "Init PC: 0x%p, SP: 0x%p\n", 
-                init_process->user_context.pc, init_process->user_context.sp);
+    // Phase 5: Create init process
+    kernel_state.init_process = CreateInitProcess(init_program, init_args);
+    if (kernel_state.init_process == NULL) {
+        TracePrintf(0, "Failed to create init process\n");
+        Halt();
+    }
+    AddToReadyQueue(kernel_state.init_process);
+    TracePrintf(1, "Created and loaded init process PID %d\n", kernel_state.init_process->pid);
     
-    // CRITICAL: Set up memory mapping for init process before switching
-    WriteRegister(REG_PTBR0, (unsigned int)kernel_state.region0_ptbr);
-    WriteRegister(REG_PTLR0, kernel_state.region0_ptlr);
-    WriteRegister(REG_PTBR1, (unsigned int)init_process->region1_ptbr);
-    WriteRegister(REG_PTLR1, VMEM_1_SIZE / PAGESIZE);
-    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_ALL);
+    // Terminals
+    InitializeTerminals();
     
-    TracePrintf(1, "Memory mapping set up for init process\n");
-    TracePrintf(1, "PTBR1: 0x%p\n", init_process->region1_ptbr);
-    
-    TracePrintf(1, "Leaving KernelStart, switching to init process\n");
-
-    // Switch directly to init process (no scheduler, no idle)
-    memcpy(uctxt, &init_process->user_context, sizeof(UserContext));
-    
-    TracePrintf(1, "Context copied, returning to user mode\n");
-    TracePrintf(1, "User mode PC: 0x%p, SP: 0x%p\n", uctxt->pc, uctxt->sp);
-
-    return;
+    // Initial dispatch
+    Schedule();
+    if (kernel_state.current_process == NULL) {
+        TracePrintf(0, "No initial process\n");
+        Halt();
+    }
+    RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+    TracePrintf(1, "Leaving KernelStart, switching to PID %d (PC=0x%p, SP=0x%p)\n",
+                kernel_state.current_process->pid, uctxt->pc, uctxt->sp);
 }
 
 int SetKernelBrk(void* addr) {
@@ -152,12 +158,4 @@ TtyState* GetTerminalState(int tty_id) {
 
 int ValidateTerminalId(int tty_id) {
     return (tty_id >= 0 && tty_id < NUM_TERMINALS);
-}
-
-// Keep the CPU busy when there's no other process to run
-void DoIdle(void) {
-    while (1) {
-        TracePrintf(1, "Idle process running\n");
-        Pause();  // Wait for next interrupt
-    }
 }
