@@ -14,7 +14,7 @@ void OrphanChildren(PCB* parent);
 PCB* FindZombieChild(PCB* parent);
 
 // Creating a process
-PCB* CreateIdleProcess(UserContext* uctxt);
+PCB* CreateIdleProcess(char* program, char** args);
 PCB* CreateInitProcess(char* program, char** args);
 
 // Scheduling
@@ -23,6 +23,7 @@ void Dispatch(PCB* next_process);
 
 // Queue management
 void AddToReadyQueue(PCB* pcb);
+void ProcessDelayQueue(void);
 void AddToDelayQueue(PCB* pcb);
 PCB* RemoveFromReadyQueue();
 void TerminateProcess(PCB* pcb, int exit_status);
@@ -31,7 +32,7 @@ void TerminateProcess(PCB* pcb, int exit_status);
 void SaveUserContext(UserContext* dest, UserContext* src);
 void RestoreUserContext(UserContext* dest, UserContext* src);
 void CopyKernelStack(PCB* src, PCB* dest);
-KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used);
 KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p);
 
 #endif
+
