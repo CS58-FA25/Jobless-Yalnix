@@ -1,7 +1,14 @@
+#include <stdlib.h>
+#include <string.h>
+
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
 #include "trap.h"
+
+static char** CopyUserArguments(char** user_args);
+static void FreeKernelArguments(char** args);
+static void DestroyPartialPCB(PCB* pcb);
 
 // Global interrupt vector table which stores function pointers for all trap handlers
 void (*interrupt_vector_table[TRAP_VECTOR_SIZE])(UserContext*);
@@ -30,16 +37,10 @@ void HandleTrapKernel(UserContext* uctxt) {
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
 
     // Step 2: Extract system call number from context and log
-    int syscall_num = uctxt->code;
-    TracePrintf(2, "Syscall %d from process %d\n", syscall_num, kernel_state.current_process->pid);
-    
-    // Handle negative syscall numbers (if any)
-    if (syscall_num < 0) {
-        // Convert from negative to positive by masking
-        syscall_num = syscall_num & 0xFF;  // Take only the lower 8 bits
-    }
-    
-    TracePrintf(2, "Syscall %d from process %d\n", syscall_num, kernel_state.current_process->pid);
+    int raw_code = uctxt->code;
+    int syscall_num = raw_code & YALNIX_MASK;
+    TracePrintf(2, "Syscall vector=0x%x (id=%d) from PID %d\n",
+                raw_code, syscall_num, kernel_state.current_process->pid);
 
     // Step 3: Dispatch to appropriate system call handler and handle unknown system call with error
     switch (syscall_num) {
@@ -71,32 +72,50 @@ void HandleTrapKernel(UserContext* uctxt) {
             SyscallTtyWrite(uctxt);
             break;
         default:
-            TracePrintf(0, "Unknown syscall: %d\n", syscall_num);
+            TracePrintf(0, "Unknown syscall code 0x%x (id=%d)\n",
+                        raw_code, syscall_num);
             uctxt->regs[0] = ERROR;
             break;
     }
     // Step 4: Restore updated user context before returning to user mode
-    if(kernel_state.current_process->state == PROCESS_RUNNING){
+    if(kernel_state.current_process != NULL && kernel_state.current_process->state == PROCESS_RUNNING){
         RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
     }
 }
 
 void HandleTrapClock(UserContext* uctxt) {
-    // Step 1: Save current process context
+    TracePrintf(2, "Clock tick\n");
+    
+    // Save context
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
     
-    // Step 2: If current process is valid running process, move to ready queue
-    PCB* current = kernel_state.current_process;
-    if (current->state == PROCESS_RUNNING) {
-        current->state = PROCESS_READY;
-        AddToReadyQueue(current);
+    // Handle delay queue: Decrement and move ready to ready_queue
+    PCB* delayed = kernel_state.delay_queue;
+    PCB* prev = NULL;
+    while (delayed != NULL) {
+        delayed->delay_remaining--;
+        PCB* next_delayed = delayed->next;
+        if (delayed->delay_remaining <= 0) {
+            // Ready: Remove from delay, add to ready
+            if (prev) prev->next = next_delayed;
+            else kernel_state.delay_queue = next_delayed;
+            delayed->next = NULL;
+            delayed->state = PROCESS_READY;
+            AddToReadyQueue(delayed);
+            TracePrintf(2, "Delay expired for PID %d\n", delayed->pid);
+        } else {
+            prev = delayed;
+        }
+        delayed = next_delayed;
     }
     
-    TracePrintf(2, "Clock trap, scheduling next process\n");
-    // Step 3: Invoke scheduler to select next process
+    // RR: Always schedule (quantum=1 tick)
     Schedule();
-    // Step 4: Restore context of newly scheduled process
-    RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+
+    // Resume whichever process the scheduler picked
+    if (kernel_state.current_process != NULL) {
+        RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+    }
 }
 
 void HandleTrapMemory(UserContext* uctxt) {
@@ -104,21 +123,32 @@ void HandleTrapMemory(UserContext* uctxt) {
     SaveUserContext(&kernel_state.current_process->user_context, uctxt);
     PCB* current = kernel_state.current_process;
     void* fault_addr = (void*)uctxt->addr;
-    
+
     TracePrintf(2, "Memory trap for process %d at address %p\n", current->pid, fault_addr);
-    
+
+    unsigned long fault = (unsigned long)fault_addr;
+    unsigned long sp = (unsigned long)current->user_context.sp;
+    unsigned long heap_brk = (unsigned long)current->user_heap_break;
+
     int result = ERROR;
-    
-    // Step 1: Attempt to handle memory fault (e.g., page fault, heap growth)
-    if (fault_addr >= (void*)VMEM_1_BASE && fault_addr < (void*)VMEM_1_LIMIT) {
-        // Check if this is a stack growth fault
-        if ((unsigned long)fault_addr < (unsigned long)current->user_context.sp) {
+
+    if (fault >= (unsigned long)VMEM_1_BASE && fault < (unsigned long)VMEM_1_LIMIT) {
+        unsigned long abs_diff = (fault > sp) ? (fault - sp) : (sp - fault);
+        int near_stack = (abs_diff <= PAGESIZE);
+        int near_heap = (fault >= heap_brk) && (fault < heap_brk + PAGESIZE);
+        int vpn = (fault - VMEM_1_BASE) >> PAGESHIFT;
+        int max_vpn = VMEM_1_SIZE / PAGESIZE;
+        int page_valid = 1;
+        if (vpn >= 0 && vpn < max_vpn && current->region1_ptbr != NULL) {
+            page_valid = current->region1_ptbr[vpn].valid;
+        }
+
+        if (!page_valid && near_stack) {
             result = GrowUserStack(current, fault_addr);
-        } 
-        // Check if this is a heap growth fault
-        else if ((unsigned long)fault_addr >= (unsigned long)current->user_heap_break && 
-                 (unsigned long)fault_addr < (unsigned long)current->user_heap_break + PAGESIZE) {
-            result = GrowUserHeap(current, (void *)UP_TO_PAGE(fault_addr));
+        } else if (!page_valid && near_heap) {
+            unsigned long fault_plus = fault + 1;
+            void* new_brk = (void*)UP_TO_PAGE(fault_plus);
+            result = GrowUserHeap(current, new_brk);
         }
     }
     
@@ -128,15 +158,20 @@ void HandleTrapMemory(UserContext* uctxt) {
         TracePrintf(1, "Handled memory trap successfully for process %d\n", current->pid);
         // Flush TLB for the faulted region if needed 
         FlushTLBEntry(fault_addr);
-    } else {
-        TracePrintf(0, "Failed to handle memory trap for process %d, terminating\n", current->pid);
-        TerminateProcess(current, ERROR);
-        Schedule();  // Schedule next process after termination
+
+        // Restore context to continue execution in the same process
+        RestoreUserContext(uctxt, &current->user_context);
         return;
     }
 
-    // Restore context to continue execution
-    RestoreUserContext(uctxt, &current->user_context);
+    TracePrintf(0, "Failed to handle memory trap for process %d, terminating\n", current->pid);
+    TerminateProcess(current, ERROR);
+
+    // Switch to another runnable process (or idle) and resume there instead
+    Schedule();
+    if (kernel_state.current_process != NULL) {
+        RestoreUserContext(uctxt, &kernel_state.current_process->user_context);
+    }
 }
 
 void HandleTrapIllegal(UserContext* uctxt) {
@@ -318,52 +353,118 @@ int ValidateUserPointer(void* ptr, int len, int access_type) {
 void SyscallFork(UserContext* uctxt) {
     PCB* parent = kernel_state.current_process;
     PCB* child = CreatePCB();
-    
-    if (!child) {
+
+    if (child == NULL) {
         uctxt->regs[0] = ERROR;
         return;
     }
-    
-    // Copy parent context and memory (per process.h)
-    child->pid = helper_new_pid(child->region1_ptbr);
-    child->parent = parent;
-    
+
+    child->kernel_stack_frames = AllocateKernelStackFrames();
+    if (child->kernel_stack_frames == NULL) {
+        DestroyPartialPCB(child);
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+
+    child->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (child->region1_ptbr == NULL) {
+        DestroyPartialPCB(child);
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+
+    int pid = helper_new_pid(child->region1_ptbr);
+    if (pid < 0) {
+        DestroyPartialPCB(child);
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+    child->pid = pid;
+
+    if (CloneRegion1AddressSpace(parent, child) == ERROR) {
+        DestroyPartialPCB(child);
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+
+    child->user_heap_break = parent->user_heap_break;
+    memcpy(&child->user_context, &parent->user_context, sizeof(UserContext));
+    child->user_context.regs[0] = 0;
+    child->state = PROCESS_READY;
+    child->kernel_context_valid = 0;
     CopyKernelStack(parent, child);
-    SetupProcessMemoryMapping(child);  
-    
+
     AddChildProcess(parent, child);
     AddToReadyQueue(child);
-    uctxt->regs[0] = child->pid;  // Child PID to parent
-    
+
+    uctxt->regs[0] = child->pid;
     TracePrintf(1, "Fork: parent %d created child %d\n", parent->pid, child->pid);
 }
 
 void SyscallExec(UserContext* uctxt) {
-    // Requires file system access; for now, terminate on error
-    char* program = (char*)uctxt->regs[0];
-    
-    
-    if (!ValidateUserString(program)) {
+    char* user_program = (char*)uctxt->regs[0];
+    char** user_args = (char**)uctxt->regs[1];
+
+    if (!ValidateUserString(user_program)) {
         uctxt->regs[0] = ERROR;
         return;
     }
-    // Implement ELF loading, reset memory, etc.
-    
-    TracePrintf(0, "Exec: %s not fully implemented\n", program);
-    uctxt->regs[0] = SUCCESS;  // Placeholder
+
+    char* program_copy = (char*)malloc(strlen(user_program) + 1);
+    if (program_copy == NULL) {
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+    strcpy(program_copy, user_program);
+
+    char** kernel_args = CopyUserArguments(user_args);
+    if (kernel_args == NULL) {
+        free(program_copy);
+        uctxt->regs[0] = ERROR;
+        return;
+    }
+
+    PCB* current = kernel_state.current_process;
+    int rc = LoadProgram(program_copy, kernel_args, current);
+
+    FreeKernelArguments(kernel_args);
+
+    if (rc == SUCCESS) {
+        free(program_copy);
+        return;  // Never returns to old user context
+    }
+
+    if (rc == KILL) {
+        TracePrintf(0, "Exec fatal error loading %s, terminating PID %d\n",
+                    program_copy, current->pid);
+        free(program_copy);
+        TerminateProcess(current, ERROR);
+        Schedule();
+        return;
+    }
+
+    free(program_copy);
+    uctxt->regs[0] = ERROR;
 }
 
 void SyscallExit(UserContext* uctxt) {
     int status = uctxt->regs[0];
     PCB* current = kernel_state.current_process;
-    
-    TracePrintf(1, "Exit: process %d exiting with status %d\n", current->pid, status);
+    TracePrintf(1, "SYS_EXIT: PID %d with status %d\n", current->pid, status);
+
     TerminateProcess(current, status);
+
+    if (current == kernel_state.init_process) {
+        TracePrintf(0, "Init exited (status %d). Halting kernel as required.\n", status);
+        kernel_state.init_process = NULL;
+        Halt();
+    }
+
     Schedule();  // Won't return here
 
     // Unreachable code here
-    TracePrintf(0, "should not reach here!\n");
-    helper_abort("SyscallExit failure");
+    TracePrintf(0, "SYS_EXIT: Unexpected return\n");
+    Halt();
 }
 
 void SyscallWait(UserContext* uctxt) {
@@ -376,36 +477,110 @@ void SyscallWait(UserContext* uctxt) {
         return;
     }
     
-    PCB* child = FindZombieChild(parent);
-    
-    if (child) {
-        // Found a zombie child
-        uctxt->regs[0] = child->pid;
-        if (status_ptr != NULL) {
-            // COMPLETED: Write status to user memory
-            *status_ptr = child->exit_status;
-        }
-        FreePCB(child);
-    } else if (parent->children == NULL) {
-        // No children at all
-        uctxt->regs[0] = ERROR;
-    } else {
-        // Has children but none are zombies - block
-        parent->state = PROCESS_BLOCKED;
-        parent->waiting_for_child = 1;
-        Schedule();
-        // When we resume, a child has exited
-        child = FindZombieChild(parent);
-        if (child) {
-            uctxt->regs[0] = child->pid;
+    while (1) {
+        PCB* child = FindZombieChild(parent);
+        if (child != NULL) {
             if (status_ptr != NULL) {
                 *status_ptr = child->exit_status;
             }
+            uctxt->regs[0] = child->pid;
+            parent->waiting_for_child = 0;
             FreePCB(child);
-        } else {
-            uctxt->regs[0] = ERROR;
+            return;
         }
+
+        if (parent->children == NULL) {
+            parent->waiting_for_child = 0;
+            uctxt->regs[0] = ERROR;
+            return;
+        }
+
+        parent->waiting_for_child = 1;
+        parent->state = PROCESS_BLOCKED;
+        Schedule();
     }
+}
+
+static void DestroyPartialPCB(PCB* pcb) {
+    if (pcb == NULL) {
+        return;
+    }
+
+    if (pcb->kernel_stack_frames != NULL) {
+        FreeKernelStackFrames(pcb->kernel_stack_frames);
+        pcb->kernel_stack_frames = NULL;
+    }
+
+    ReleaseRegion1Frames(pcb);
+    if (pcb->region1_ptbr != NULL) {
+        free(pcb->region1_ptbr);
+        pcb->region1_ptbr = NULL;
+    }
+
+    if (pcb->pid >= 0) {
+        helper_retire_pid(pcb->pid);
+        pcb->pid = -1;
+    }
+
+    free(pcb);
+}
+
+static char** CopyUserArguments(char** user_args) {
+    if (user_args == NULL) {
+        char** empty = (char**)malloc(sizeof(char*));
+        if (empty == NULL) {
+            return NULL;
+        }
+        empty[0] = NULL;
+        return empty;
+    }
+
+    int count = 0;
+    while (1) {
+        if (!ValidateUserPointer(user_args + count, sizeof(char*), PROT_READ)) {
+            return NULL;
+        }
+        char* arg_ptr = user_args[count];
+        if (arg_ptr == NULL) {
+            break;
+        }
+        if (!ValidateUserString(arg_ptr)) {
+            return NULL;
+        }
+        count++;
+    }
+
+    char** kernel_args = (char**)malloc((count + 1) * sizeof(char*));
+    if (kernel_args == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i <= count; i++) {
+        kernel_args[i] = NULL;
+    }
+
+    for (int i = 0; i < count; i++) {
+        char* src = user_args[i];
+        size_t len = strlen(src) + 1;
+        kernel_args[i] = (char*)malloc(len);
+        if (kernel_args[i] == NULL) {
+            FreeKernelArguments(kernel_args);
+            return NULL;
+        }
+        memcpy(kernel_args[i], src, len);
+    }
+    kernel_args[count] = NULL;
+    return kernel_args;
+}
+
+static void FreeKernelArguments(char** args) {
+    if (args == NULL) {
+        return;
+    }
+    for (int i = 0; args[i] != NULL; i++) {
+        free(args[i]);
+    }
+    free(args);
 }
 
 void SyscallGetPid(UserContext* uctxt) {
@@ -416,79 +591,44 @@ void SyscallGetPid(UserContext* uctxt) {
 }
 
 void SyscallDelay(UserContext* uctxt) {
-    int clock_ticks = uctxt->regs[0];  
-    
-    TracePrintf(2, "Delay: process %d delaying for %d ticks\n", 
-                kernel_state.current_process->pid, clock_ticks);
-    
-    // Validate argument
-    if (clock_ticks < 0) {
-        uctxt->regs[0] = ERROR;
-        TracePrintf(0, "Delay: invalid tick count %d\n", clock_ticks);
-        return;
-    }
-    
-    // If delay is 0, return immediately
-    if (clock_ticks == 0) {
-        uctxt->regs[0] = SUCCESS;
-        return;
-    }
-    
-    // Set up delay tracking in PCB
+    int ticks = (int)uctxt->regs[0];  // User arg
     PCB* current = kernel_state.current_process;
-    current->delay_remaining = clock_ticks;
+
+    TracePrintf(1, "Delay: PID %d requested %d ticks\n", current->pid, ticks);
+    TracePrintf(1, "Delay regs: [%d %d %d %d %d %d %d %d], code=0x%x\n",
+                uctxt->regs[0], uctxt->regs[1], uctxt->regs[2], uctxt->regs[3],
+                uctxt->regs[4], uctxt->regs[5], uctxt->regs[6], uctxt->regs[7],
+                uctxt->code);
+
+    if (ticks <= 0) {
+        uctxt->regs[0] = 0;
+        return;
+    }
+
+    current->delay_remaining = ticks;
     current->state = PROCESS_BLOCKED;
-    
-    // Add to delay queue (you'll need to implement this)
     AddToDelayQueue(current);
-    
-    TracePrintf(1, "Delay: process %d blocked for %d ticks\n", 
-                current->pid, clock_ticks);
-    
-    // Schedule another process
-    Schedule();
-    
-    // When we resume, the delay has completed
-    uctxt->regs[0] = SUCCESS;
+    uctxt->regs[0] = 0;  // Success
+    Schedule();  // Switch away until timer wakes us
+    TracePrintf(1, "Delay: PID %d completed %d ticks\n", current->pid, ticks);
 }
-/*
-void SyscallBrk(UserContext* uctxt) {
-    void* addr = (void*)uctxt->regs[0];  // First argument
-    PCB* current = kernel_state.current_process;
-    
-    TracePrintf(2, "Brk: process %d requesting brk at %p\n", 
-                current->pid, addr);
-    
-    // Validate address is in Region 1
-    if ((unsigned long)addr < (unsigned long)VMEM_1_BASE || (unsigned long)addr >= (unsigned long)VMEM_1_LIMIT) {
-        uctxt->regs[0] = ERROR;
-        TracePrintf(0, "Brk: address %p outside Region 1\n", addr);
-        return;
-    }
-    
-    // Round up to page boundary
-    void* new_brk = (void*)UP_TO_PAGE(addr);
-    
-    // Handle the brk request
-    int result = GrowUserHeap(current, new_brk);
-    uctxt->regs[0] = result;
-    
-    if (result == SUCCESS) {
-        TracePrintf(1, "Brk: process %d heap now ends at %p\n", 
-                    current->pid, current->user_heap_break);
-    } else {
-        TracePrintf(0, "Brk: failed to grow heap to %p\n", new_brk);
-    }
-}
-*/
+
 
 void SyscallBrk(UserContext* uctxt) {
     void* addr = (void*)uctxt->regs[0];
-    TracePrintf(2, "Brk: process %d requesting brk at %p\n", 
-                kernel_state.current_process->pid, addr);
-    
-    // For now, just return success without blocking
-    uctxt->regs[0] = SUCCESS;
+    PCB* current = kernel_state.current_process;
+    if (addr == NULL) {
+        uctxt->regs[0] = (int)current->user_heap_break;
+        TracePrintf(2, "Brk: PID %d queried break -> %p\n", current->pid, current->user_heap_break);
+        return;
+    }
+    int result = GrowUserHeap(current, addr);
+    if (result == SUCCESS) {
+        uctxt->regs[0] = (int)current->user_heap_break;
+    } else {
+        uctxt->regs[0] = ERROR;
+    }
+    TracePrintf(2, "Brk: PID %d to %p -> %p\n", current->pid, addr, current->user_heap_break);
 }
 
 void SyscallTtyRead(UserContext* uctxt) {
