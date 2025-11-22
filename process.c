@@ -3,7 +3,44 @@
 #include "process.h"
 #include "trap.h"
 
+static PCB* CreateUserProcess(const char* tag, char* program, char** args) {
+    TracePrintf(1, "%s: starting for %s\n", tag, program ? program : "<null>");
 
+    PCB* pcb = CreatePCB();
+    if (pcb == NULL) {
+        return NULL;
+    }
+
+    pcb->kernel_stack_frames = AllocateKernelStackFrames();
+    if (pcb->kernel_stack_frames == NULL) {
+        FreePCB(pcb);
+        return NULL;
+    }
+
+    pcb->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
+    if (pcb->region1_ptbr == NULL) {
+        FreePCB(pcb);
+        return NULL;
+    }
+
+    int pid = helper_new_pid(pcb->region1_ptbr);
+    if (pid < 0) {
+        FreePCB(pcb);
+        return NULL;
+    }
+    pcb->pid = pid;
+
+    if (LoadProgram(program, args, pcb) == ERROR) {
+        FreePCB(pcb);
+        return NULL;
+    }
+
+    pcb->state = PROCESS_READY;
+
+    TracePrintf(1, "%s: PID %d ready (PC=%p, SP=%p)\n",
+                tag, pcb->pid, pcb->user_context.pc, pcb->user_context.sp);
+    return pcb;
+}
 
 PCB* CreatePCB() {
     // Allocate and initialize a new PCB
@@ -19,9 +56,11 @@ PCB* CreatePCB() {
 
 void InitializePCB(PCB* pcb) {
     if (pcb == NULL) return;
+
     pcb->state = PROCESS_READY;
     pcb->pid = -1;
     pcb->kernel_stack_size = KERNEL_STACK_MAXSIZE;
+    pcb->kernel_context_valid = 0;
     pcb->user_heap_break = (void*)VMEM_1_BASE;  // Start of Region 1
     pcb->parent = NULL;
     pcb->children = NULL;
@@ -44,17 +83,8 @@ void FreePCB(PCB* pcb) {
         pcb->kernel_stack_frames = NULL;
     }
     
-    // Free Region 1 page table and all mapped frames
+    ReleaseRegion1Frames(pcb);
     if (pcb->region1_ptbr != NULL) {
-        // Free all mapped frames in Region 1
-        int num_pages = VMEM_1_SIZE / PAGESIZE;
-        for (int vpn = 0; vpn < num_pages; vpn++) {
-            if (pcb->region1_ptbr[vpn].valid) {
-                FreeFrame(pcb->region1_ptbr[vpn].pfn);
-            }
-        }
-        
-        // Free the page table itself
         free(pcb->region1_ptbr);
         pcb->region1_ptbr = NULL;
     }
@@ -73,176 +103,87 @@ void FreePCB(PCB* pcb) {
     free(pcb);
 }
 
-PCB* CreateIdleProcess(UserContext* uctxt) {
-    PCB* idle = CreatePCB();
-    if (idle == NULL) return NULL;
-    
-    // Create Region 1 page table
-    idle->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
-    if (idle->region1_ptbr == NULL) {
-        free(idle);
-        return NULL;
-    }
-    
-    // Allocate kernel stack
-    idle->kernel_stack_frames = AllocateKernelStackFrames();
-    if (idle->kernel_stack_frames == NULL) {
-        free(idle->region1_ptbr);
-        free(idle);
-        return NULL;
-    }
-
-    // Set up a simple user stack in Region 1
-    int user_stack_vpn = (VMEM_1_LIMIT - PAGESIZE - VMEM_1_BASE) >> PAGESHIFT;
-    int user_stack_pfn = AllocateFrame();
-    if (user_stack_pfn == ERROR) {
-        FreeKernelStackFrames(idle->kernel_stack_frames);
-        free(idle->region1_ptbr);
-        free(idle);
-        return NULL;
-    }
-
-    MapPage(idle->region1_ptbr, user_stack_vpn, user_stack_pfn, PROT_READ | PROT_WRITE);
-    
-    // Set up user context to run a simple loop in user mode
-    memcpy(&idle->user_context, uctxt, sizeof(UserContext));
-    
-    // Use the original entry point from uctxt, but make sure it's valid
-    // If the original PC is in kernel space, set a safe user space address
-    if ((unsigned long)idle->user_context.pc < (unsigned long)VMEM_1_BASE) {
-        // Original PC is in kernel space, set a safe user space address
-        idle->user_context.pc = (void*)VMEM_1_BASE;  // Start of user space
-    }
-    
-    idle->user_context.sp = (void*)(VMEM_1_LIMIT - sizeof(void*));  // Top of user stack
-    
-    // Get PID
-    idle->pid = helper_new_pid(idle->region1_ptbr);
-    idle->state = PROCESS_READY;
-    
-    TracePrintf(1, "Created idle process PID %d\n", idle->pid);
-    TracePrintf(1, "Idle PC: 0x%p, SP: 0x%p\n", 
-                idle->user_context.pc, idle->user_context.sp);
-    
-    return idle;
+PCB* CreateIdleProcess(char* program, char** args) {
+    return CreateUserProcess("CreateIdleProcess", program, args);
 }
 
 PCB* CreateInitProcess(char* program, char** args) {
-    TracePrintf(1, "CreateInitProcess: starting\n");
-
-    PCB* init = CreatePCB();
-    if (init == NULL) return NULL;
-
-    // Allocate kernel stack
-    init->kernel_stack_frames = AllocateKernelStackFrames();
-    if (init->kernel_stack_frames == NULL) {
-        FreePCB(init);
-        return NULL;
-    }
-    
-    // Create empty Region 1 page table
-    init->region1_ptbr = CreateEmptyPageTable(VMEM_1_SIZE / PAGESIZE);
-    if (init->region1_ptbr == NULL) {
-        FreePCB(init);
-        return NULL;
-    }
-
-    // Get PID
-    init->pid = helper_new_pid(init->region1_ptbr);
-
-    // Load the program - this sets up user_context.pc and user_context.sp
-    if (LoadProgram(program, args, init) == ERROR) {
-        helper_retire_pid(init->pid);
-        FreePCB(init);
-        return NULL;
-    }
-
-    // initialize kernel context
-    memset(&init->kernel_context, 0, sizeof(KernelContext));
-    // Set up any initial kernel context values as needed
-    
-    init->state = PROCESS_READY;
-    
-    TracePrintf(1, "Created init process PID %d\n", init->pid);
-    TracePrintf(1, "  PC: 0x%p, SP: 0x%p\n", 
-                init->user_context.pc, init->user_context.sp);
-    return init;
+    return CreateUserProcess("CreateInitProcess", program, args);
 }
 
 void AddToReadyQueue(PCB* pcb) {
     if (pcb == NULL) return;
-    // Add the PCB to the end of the ready queue
-
-    TracePrintf(2, "AddToReadyQueue: adding PID=%d\n", pcb->pid);
-
-    pcb->state = PROCESS_READY;
     pcb->next = NULL;
-    
     if (kernel_state.ready_queue == NULL) {
         kernel_state.ready_queue = pcb;
-        TracePrintf(2, "  Added to first of queue\n");
+        kernel_state.ready_queue_tail = pcb;
     } else {
-        PCB* current = kernel_state.ready_queue;
-        while (current->next != NULL) {
+        kernel_state.ready_queue_tail->next = pcb;
+        kernel_state.ready_queue_tail = pcb;
+    }
+    TracePrintf(2, "Added PID %d to ready queue\n", pcb->pid);
+}
+
+void ProcessDelayQueue(void) {
+    PCB* prev = NULL;
+    PCB* current = kernel_state.delay_queue;
+    
+    while (current != NULL) {
+        // Decrement the delay counter
+        current->delay_remaining--;
+        
+        TracePrintf(3, "ProcessDelayQueue: PID %d has %d ticks remaining\n",
+                   current->pid, current->delay_remaining);
+        
+        // Check if delay has expired
+        if (current->delay_remaining <= 0) {
+            // Remove from delay queue
+            PCB* next = current->next;
+            
+            if (prev == NULL) {
+                kernel_state.delay_queue = next;
+            } else {
+                prev->next = next;
+            }
+            
+            // Move to ready queue
+            current->state = PROCESS_READY;
+            current->next = NULL;
+            AddToReadyQueue(current);
+            
+            TracePrintf(1, "Delay expired for process %d, moved to ready queue\n",
+                       current->pid);
+            
+            current = next;
+        } else {
+            prev = current;
             current = current->next;
         }
-        current->next = pcb;
-        TracePrintf(2, "  Added to end of queue\n");
-    }
-    
-    TracePrintf(2, "Added process %d to ready queue\n", pcb->pid);
-    TracePrintf(2, "Queue after adding PID=%d:\n", pcb->pid);
-    PCB* temp = kernel_state.ready_queue;
-    while (temp != NULL) {
-        TracePrintf(2, "  PID=%d\n", temp->pid);
-        temp = temp->next;
     }
 }
 
 void AddToDelayQueue(PCB* pcb) {
     if (pcb == NULL) return;
-    
-    // Add the PCB to the delay queue
-    pcb->next = NULL;
-    
-    if (kernel_state.delay_queue == NULL) {
-        kernel_state.delay_queue = pcb;
-    } else {
-        PCB* current = kernel_state.delay_queue;
-        while (current->next != NULL) {
-            current = current->next;
-        }
-        current->next = pcb;
-    }
-    
-    TracePrintf(1, "Added process %d to delay queue\n", 
-                pcb->pid);
+    pcb->next = kernel_state.delay_queue;
+    kernel_state.delay_queue = pcb;
+    TracePrintf(2, "Added PID %d to delay queue\n", pcb->pid);
 }
 
 PCB* RemoveFromReadyQueue() {
-    // Remove and return the first PCB from the ready queue
-    PCB* pcb = kernel_state.ready_queue;
-
-    if (pcb != NULL) {
-        kernel_state.ready_queue = pcb->next;
-        pcb->next = NULL;
-        TracePrintf(2, "Removed process %d from ready queue\n", pcb->pid);
-
-        TracePrintf(2, "Remaining queue:\n");
-        PCB* temp = kernel_state.ready_queue;
-        while (temp != NULL) {
-            TracePrintf(2, "  PID=%d\n", temp->pid);
-            temp = temp->next;
+    PCB* front = kernel_state.ready_queue;
+    if (front != NULL) {
+        kernel_state.ready_queue = front->next;
+        if (kernel_state.ready_queue == NULL) {
+            kernel_state.ready_queue_tail = NULL;
         }
-    } else {
-        TracePrintf(2, "Ready queue is empty\n");
+        front->next = NULL;
+        TracePrintf(2, "Removed PID %d from ready queue\n", front->pid);
     }
-    return pcb;
+    return front;
 }
 
 void TerminateProcess(PCB* pcb, int exit_status) {
     if (pcb == NULL) return;
-    
     TracePrintf(1, "Terminating process %d with exit status %d\n", 
                 pcb->pid, exit_status);
     
@@ -251,151 +192,130 @@ void TerminateProcess(PCB* pcb, int exit_status) {
     pcb->exit_status = exit_status;
     pcb->is_zombie = 1;
     
+    // Orphan children to init (or null if init missing)
+    OrphanChildren(pcb);
+
     // Add to zombie list for parent to collect
     pcb->next = kernel_state.zombie_list;
     kernel_state.zombie_list = pcb;
     
-    // Notify parent if waiting
-    if (pcb->parent != NULL && pcb->parent->state == PROCESS_BLOCKED) {
-        // Check if parent is waiting for this child
-        // This would require checking the parent's wait state
-        // For now, just mark that a child has terminated
-        TracePrintf(2, "Process %d has terminated, parent %d may be waiting\n",
-                    pcb->pid, pcb->parent->pid);
+    // Cleanup: release Region 1 frames, but keep page table allocated until wait() reaps
+    ReleaseRegion1Frames(pcb);
+    
+    // Clear user page table registers and flush TLB to prevent lingering mappings
+    if (kernel_state.current_process == pcb) {
+        WriteRegister(REG_PTBR1, 0);
+        WriteRegister(REG_PTLR1, 0);
+        FlushAllTLB();
     }
     
-    // If this is the init process and it's exiting, halt the system
-    if (pcb == kernel_state.init_process) {
-        TracePrintf(0, "Init process exiting, halting system\n");
-        Halt();
+    // Wake parent waiting in Wait
+    if (pcb->parent && pcb->parent->waiting_for_child) {
+        pcb->parent->waiting_for_child = 0;
+        if (pcb->parent->state == PROCESS_BLOCKED) {
+            pcb->parent->state = PROCESS_READY;
+            AddToReadyQueue(pcb->parent);
+        }
     }
-    
-    // If this is the current process, schedule another one
-    if (pcb == kernel_state.current_process) {
-        TracePrintf(2, "Terminating current process, scheduling next\n");
-        Schedule();
-    }
+
+    // Note: Do NOT free kernel stack or PCB yet -- wait for wait() to reap and call FreePCB
+    TracePrintf(1, "PID %d terminated: resources freed, added to zombie list\n", pcb->pid);
 }
 
 void Schedule() {
+    TracePrintf(2, "=== Schedule Called ===\n");
     PCB* current = kernel_state.current_process;
+    if (current) {
+        TracePrintf(2, "Current: PID=%d, state=%d\n", current->pid, current->state);
+    }
+    
+    // If current running, move to ready (unless blocked/zombie)
+    if (current && current->state == PROCESS_RUNNING && current != kernel_state.idle_process) {
+        current->state = PROCESS_READY;
+        AddToReadyQueue(current);
+    }
+    
+    // Pick next from ready
     PCB* next = RemoveFromReadyQueue();
-    
-    TracePrintf(1, "=== Schedule Called ===\n");
-    TracePrintf(1, "Current process: PID=%d, state=%d\n", 
-                current ? current->pid : -1, current ? current->state : -1);
-    TracePrintf(1, "Next process from queue: PID=%d\n", next ? next->pid : -1);
-
-    // If no ready process, switch to idle
     if (next == NULL) {
-        TracePrintf(2, "No ready processes, keeping current process\n");
-        return;
+        // Fallback to idle
+        next = kernel_state.idle_process;
+        if (next == NULL) {
+            TracePrintf(0, "Schedule: No idle, halting\n");
+            Halt();
+        }
+        TracePrintf(2, "Fallback to idle PID %d\n", next->pid);
     }
     
-    // If next process does not match current, conduct context switch
-    if (next != current) {
-        // If current is not idle and still runnable, re-add to ready queue
-        if (current != NULL && current->state == PROCESS_RUNNING) {
-            current->state = PROCESS_READY;
-            AddToReadyQueue(current);
-        }
-        
-        // Dispatch the next process
-        Dispatch(next);
-        TracePrintf(0, "ERROR: Returned from Dispatch()! Context switch failed.\n");
-    } else{
-        TracePrintf(1, "Schedule: staying with current process %d\n", current->pid);
-    }
+    // Dispatch
+    Dispatch(next);
+    TracePrintf(2, "Next: PID=%d\n", next->pid);
 }
 
 void Dispatch(PCB* next_process) {
-    PCB* old_process = kernel_state.current_process;
+    if (next_process == NULL) {
+        TracePrintf(0, "Dispatch: NULL next_process, halting\n");
+        Halt();
+        return;
+    }
 
-    TracePrintf(1, "=== Dispatch Called ===\n");
-    TracePrintf(1, "Old process: PID=%d\n", old_process ? old_process->pid : -1);
-    TracePrintf(1, "Next process: PID=%d, PC=0x%p, SP=0x%p\n", 
-                next_process->pid, next_process->user_context.pc, 
-                next_process->user_context.sp);
+    PCB* previous = kernel_state.current_process;
+    if (previous == next_process) {
+        if (next_process != NULL) {
+            next_process->state = PROCESS_RUNNING;
+        }
+        TracePrintf(2, "Dispatch: Already running PID %d, no switch\n",
+                    previous ? previous->pid : -1);
+        return;
+    }
+
+    TracePrintf(1, "Dispatch: Switching from PID %d to PID %d\n", 
+                (previous ? previous->pid : -1), next_process->pid);
 
     kernel_state.current_process = next_process;
     next_process->state = PROCESS_RUNNING;
-    
-    TracePrintf(1, "Dispatching from process %d to process %d\n",
-                old_process ? old_process->pid : -1, 
-                next_process->pid);
-    
-    // This includes both Region 0 (kernel stack) and Region 1 (user space)
-    
-    // Set up Region 0 mapping (kernel) - this should already be set correctly
-    WriteRegister(REG_PTBR0, (unsigned int)kernel_state.region0_ptbr);
-    WriteRegister(REG_PTLR0, kernel_state.region0_ptlr);
-    
-    // Set up Region 1 mapping (user) for the new process
-    WriteRegister(REG_PTBR1, (unsigned int)next_process->region1_ptbr);
-    WriteRegister(REG_PTLR1, VMEM_1_SIZE / PAGESIZE);
-    
-    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
-    int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
-    
-    for (int i = 0; i < kernel_stack_pages; i++) {
-        if (next_process->kernel_stack_frames[i] != ERROR) {
-            kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 1;
-            kernel_state.region0_ptbr[kernel_stack_vpn + i].pfn = next_process->kernel_stack_frames[i];
-            kernel_state.region0_ptbr[kernel_stack_vpn + i].prot = PROT_READ | PROT_WRITE;
-            TracePrintf(3, "Dispatch: mapped kernel stack VPN %d to PFN %d\n", 
-                       kernel_stack_vpn + i, next_process->kernel_stack_frames[i]);
-        }
-    }
 
-    // Flush TLB for both regions to avoid stale mappings
-    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_ALL);
-    
-    TracePrintf(1, "Dispatching to process %d: PC=0x%p, SP=0x%p\n",
-                next_process->pid, next_process->user_context.pc, 
-                next_process->user_context.sp);
+    // Set up memory mapping (PTBR1/PTLR1 for user; 0 for kernel/idle)
+    SetupProcessMemoryMapping(next_process);
 
-    // Perform context switch
-    int rc = KernelContextSwitch(KCSwitch, old_process, next_process);
-    if (rc == ERROR) {
-        TracePrintf(0, "KernelContextSwitch failed\n");
+    if (KernelContextSwitch(KCSwitch, previous, next_process) < 0) {
+        TracePrintf(0, "Dispatch: KernelContextSwitch failed for PID %d\n", next_process->pid);
         Halt();
     }
-}
-
-KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used) {
-    PCB* new_pcb = (PCB*)new_pcb_p;
-    TracePrintf(1, "KCCopy: starting for new process PID %d\n", new_pcb->pid);
-
-    // Copy kernel context
-    memcpy(&new_pcb->kernel_context, kc_in, sizeof(KernelContext));
-    TracePrintf(2, "KCCopy: copied kernel context for process %d\n", new_pcb->pid);
-    
-    CopyKernelStack(kernel_state.current_process, new_pcb);
-    
-    TracePrintf(1, "KCCopy: completed\n");
-    
-    return kc_in;
 }
 
 KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p) {
     PCB* curr_pcb = (PCB*)curr_pcb_p;
     PCB* next_pcb = (PCB*)next_pcb_p;
     
-    TracePrintf(1, "KCSwitch: saving context of %d, restoring context of %d\n",
-                curr_pcb ? curr_pcb->pid : -1, 
-                next_pcb ? next_pcb->pid : -1);
-
-    // Save current context
-    if (curr_pcb != NULL) {
-        memcpy(&curr_pcb->kernel_context, kc_in, sizeof(KernelContext));
-        TracePrintf(2, "KCSwitch: saved kernel context for process %d\n", curr_pcb->pid);
+    if (next_pcb == NULL) {
+        TracePrintf(0, "KCSwitch: next process is NULL\n");
+        return kc_in;
     }
 
-    TracePrintf(1, "KCSwitch: returning context for process %d\n", next_pcb->pid);
-    TracePrintf(1, "KCSwitch: user context - PC=0x%p, SP=0x%p\n",
-                next_pcb->user_context.pc, next_pcb->user_context.sp);
+    TracePrintf(1, "KCSwitch: saving PID %d, loading PID %d\n",
+                curr_pcb ? curr_pcb->pid : -1,
+                next_pcb->pid);
 
-    // Return the new process's kernel context
+    if (curr_pcb != NULL && kc_in != NULL) {
+        memcpy(&curr_pcb->kernel_context, kc_in, sizeof(KernelContext));
+        curr_pcb->kernel_context_valid = 1;
+    }
+
+    if (!next_pcb->kernel_context_valid) {
+        if (kc_in == NULL) {
+            TracePrintf(0, "KCSwitch: cannot initialize PID %d without kc_in\n", next_pcb->pid);
+            return kc_in;
+        }
+
+        TracePrintf(1, "KCSwitch: initializing kernel context for PID %d\n", next_pcb->pid);
+        memcpy(&next_pcb->kernel_context, kc_in, sizeof(KernelContext));
+        CopyKernelStack(curr_pcb, next_pcb);
+        next_pcb->kernel_context_valid = 1;
+    }
+
+    SwitchKernelStackMapping(next_pcb);
+
     return &next_pcb->kernel_context;
 }
 
@@ -410,30 +330,30 @@ void RestoreUserContext(UserContext* dest, UserContext* src) {
         TracePrintf(0, "RestoreUserContext: NULL pointers\n");
         return;
     }
-    
     TracePrintf(2, "RestoreUserContext: copying from %p to %p\n", src, dest);
-    TracePrintf(2, "  PC: 0x%p, SP: 0x%p\n", src->pc, src->sp);
-    
     memcpy(dest, src, sizeof(UserContext));
-    
-    TracePrintf(2, "RestoreUserContext: completed\n");
 }
 
 void SetupProcessMemoryMapping(PCB* pcb) {
-    if (pcb == NULL) return;
-    
-    // Set up Region 0 mapping (kernel)
-    WriteRegister(REG_PTBR0, (unsigned int)kernel_state.region0_ptbr);
-    WriteRegister(REG_PTLR0, kernel_state.region0_ptlr);
-    
-    // Set up Region 1 mapping (user)
-    WriteRegister(REG_PTBR1, (unsigned int)pcb->region1_ptbr);
-    WriteRegister(REG_PTLR1, VMEM_1_SIZE / PAGESIZE);
-    
-    // Flush TLB for Region 1
-    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_1);
-    
-    TracePrintf(2, "Setup memory mapping for process %d\n", pcb->pid);
+    if (pcb == NULL) {
+        return;
+    }
+
+    TracePrintf(2, "SetupProcessMemoryMapping: PID %d (PTBR1=0x%p)\n",
+                pcb->pid, pcb->region1_ptbr);
+
+    if (pcb->region1_ptbr != NULL) {
+        WriteRegister(REG_PTBR1, (unsigned int)pcb->region1_ptbr);
+        WriteRegister(REG_PTLR1, VMEM_1_SIZE / PAGESIZE);
+        TracePrintf(2, "  User mapping -> PTLR1=%d\n", VMEM_1_SIZE / PAGESIZE);
+    } else {
+        WriteRegister(REG_PTBR1, 0);
+        WriteRegister(REG_PTLR1, 0);
+        TracePrintf(2, "  Kernel-only mapping (Region 1 disabled)\n");
+    }
+
+    FlushAllTLB();
+    TracePrintf(2, "  TLB flushed\n");
 }
 
 // Process relationship management
@@ -474,14 +394,21 @@ void RemoveChildProcess(PCB* parent, PCB* child) {
 
 void OrphanChildren(PCB* parent) {
     if (parent == NULL) return;
-    
-    // Set all children parent to NULL
     PCB* child = parent->children;
-    while (child != NULL) {
-        child->parent = NULL;
-        child = child->siblings;
-    }
     parent->children = NULL;
+
+    while (child != NULL) {
+        PCB* next = child->siblings;
+        if (kernel_state.init_process != NULL && child != kernel_state.init_process) {
+            child->parent = kernel_state.init_process;
+            child->siblings = kernel_state.init_process->children;
+            kernel_state.init_process->children = child;
+        } else {
+            child->parent = NULL;
+            child->siblings = NULL;
+        }
+        child = next;
+    }
 }
 
 PCB* FindZombieChild(PCB* parent) {
@@ -509,3 +436,4 @@ PCB* FindZombieChild(PCB* parent) {
     // No zombie child found
     return NULL;
 }
+
