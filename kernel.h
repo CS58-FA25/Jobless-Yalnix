@@ -29,6 +29,7 @@ typedef struct PCB {
     int is_zombie;
     int waiting_for_child;
     int delay_remaining;
+    int kernel_context_valid;
 } PCB;
 
 // TTY buffer for storing input lines
@@ -54,13 +55,14 @@ typedef struct TtyState {
 typedef struct KernelState {
     PCB* current_process;
     PCB* ready_queue;
+    PCB* ready_queue_tail;
     PCB* delay_queue;
     PCB* idle_process;
     PCB* init_process;
     PCB* zombie_list;
     
     // Memory management
-    unsigned long* free_frame_bitmap;
+    unsigned char* free_frame_bitmap;
     int total_frames;
     int used_frames;
     
@@ -72,9 +74,6 @@ typedef struct KernelState {
     void* kernel_brk;              // Current kernel break
     void* original_kernel_brk;     // Break at VM enable time
     int vm_enabled;                // Virtual memory enabled flag
-    
-    // Process management
-    int next_pid;
     
     // Terminal management
     TtyState* terminals[NUM_TERMINALS];
@@ -109,7 +108,7 @@ int SetKernelBrk(void* addr);
 PCB* CreatePCB();
 void InitializePCB(PCB* pcb);
 void FreePCB(PCB* pcb);
-PCB* CreateIdleProcess(UserContext* uctxt);
+PCB* CreateIdleProcess(char* program, char** args);
 PCB* CreateInitProcess(char* program, char** args);
 void AddToReadyQueue(PCB* pcb);
 PCB* RemoveFromReadyQueue();
@@ -131,7 +130,6 @@ void RestoreUserContext(UserContext* dest, UserContext* src);
 void CopyKernelStack(PCB* src, PCB* dest);
 
 // Context switching
-KernelContext* KCCopy(KernelContext* kc_in, void* new_pcb_p, void* not_used);
 KernelContext* KCSwitch(KernelContext* kc_in, void* curr_pcb_p, void* next_pcb_p);
 
 // Terminal management functions
@@ -142,7 +140,6 @@ int ValidateTerminalId(int tty_id);
 // Helper functions
 void InitializeInterruptVectorTable();
 void SetupProcessMemoryMapping(PCB* pcb);
-void DoIdle(void);
 
 // Load program
 int LoadProgram(char *program, char **args, PCB *init_pcb);
