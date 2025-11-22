@@ -164,13 +164,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
      * ==>> current process by walking through the R1 page table and,
      * ==>> for every valid page, free the pfn and mark the page invalid.
      */
-    int num_pages = VMEM_1_SIZE / PAGESIZE;
-    for (int vpn = 0; vpn < num_pages; vpn++) {
-        if (proc->region1_ptbr[vpn].valid) {
-            FreeFrame(proc->region1_ptbr[vpn].pfn);
-            proc->region1_ptbr[vpn].valid = 0;
-        }
-    }
+    ReleaseRegion1Frames(proc);
 
     /*
      * ==>> Then, build up the new region1.  
@@ -189,7 +183,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
             TracePrintf(0, "LoadProgram: out of memory for text segment\n");
             free(argbuf);
             close(fd);
-            return ERROR;
+            return KILL;
         }
         MapPage(proc->region1_ptbr, text_pg1 + i, pfn, PROT_READ | PROT_WRITE);
     }
@@ -206,10 +200,14 @@ int LoadProgram(char *name, char *args[], PCB* proc)
             TracePrintf(0, "LoadProgram: out of memory for data segment\n");
             free(argbuf);
             close(fd);
-            return ERROR;
+            return KILL;
         }
         MapPage(proc->region1_ptbr, data_pg1 + i, pfn, PROT_READ | PROT_WRITE);
     }
+
+    // Heap begins immediately after the loaded data+bss segment
+    unsigned long heap_break_vpn = data_pg1 + data_npg;
+    proc->user_heap_break = (void*)(VMEM_1_BASE + (heap_break_vpn << PAGESHIFT));
 
     /* 
      * ==>> Then, stack. Allocate "stack_npg" physical pages and map them to the top
@@ -224,7 +222,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
             TracePrintf(0, "LoadProgram: out of memory for stack\n");
             free(argbuf);
             close(fd);
-            return ERROR;
+            return KILL;
         }
         MapPage(proc->region1_ptbr, stack_start_vpn + i, pfn, PROT_READ | PROT_WRITE);
     }
@@ -263,7 +261,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
             kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
             free(argbuf);
             close(fd);
-            return ERROR;
+            return KILL;
         }
         
         // Restore mapping
@@ -293,7 +291,7 @@ int LoadProgram(char *name, char *args[], PCB* proc)
             kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
             free(argbuf);
             close(fd);
-            return ERROR;
+            return KILL;
         }
         
         kernel_state.region0_ptbr[TEMP_PAGE_VPN] = saved_pte;
@@ -364,4 +362,6 @@ int LoadProgram(char *name, char *args[], PCB* proc)
 
     return SUCCESS;
 }
+
+
 
