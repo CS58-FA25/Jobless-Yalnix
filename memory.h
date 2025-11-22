@@ -36,6 +36,8 @@ pte_t* CreateEmptyPageTable(int num_pages);
 pte_t* CopyPageTable(pte_t* src, int num_pages);
 void CopyKernelStack(PCB* src, PCB* dest);
 void SwitchKernelStackMapping(PCB* pcb);
+int CloneRegion1AddressSpace(PCB* parent, PCB* child);
+void ReleaseRegion1Frames(PCB* pcb);
 
 // TLB management
 void FlushTLBEntry(void* vaddr);
@@ -56,3 +58,4 @@ void InitializeTempMappings(void);
 #define TEMP_PAGE_VPN_2 ((KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT) - 2
 
 #endif
+
