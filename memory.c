@@ -1,27 +1,187 @@
 #include "kernel.h"
 #include "memory.h"
 #include "process.h"
+#include "trap.h"
+
+static TempMapping temp_mappings[MAX_TEMP_MAPPINGS];
+
+void InitializeTempMappings(void) {
+    for (int i = 0; i < MAX_TEMP_MAPPINGS; i++) {
+        temp_mappings[i].active = 0;
+    }
+}
+
+void* MapFrameTemporary(int pfn, int prot, int slot) {
+    if (slot < 0 || slot >= MAX_TEMP_MAPPINGS) {
+        TracePrintf(0, "MapFrameTemporary: invalid slot %d\n", slot);
+        return NULL;
+    }
+    
+    if (temp_mappings[slot].active) {
+        TracePrintf(0, "MapFrameTemporary: slot %d already active!\n", slot);
+        return NULL;
+    }
+    
+    // Use different VPNs for different slots
+    int temp_vpn = 124 + slot; // VPN 124 and 125
+    
+    // Save original mapping
+    temp_mappings[slot].saved_mapping = kernel_state.region0_ptbr[temp_vpn];
+    temp_mappings[slot].vpn = temp_vpn;
+    
+    // Map the frame temporarily
+    kernel_state.region0_ptbr[temp_vpn].valid = 1;
+    kernel_state.region0_ptbr[temp_vpn].pfn = pfn;
+    kernel_state.region0_ptbr[temp_vpn].prot = prot;
+    
+    // Flush TLB for the temporary mapping
+    FlushTLBEntry((void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT)));
+    
+    temp_mappings[slot].active = 1;
+    
+    return (void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT));
+}
+
+void UnmapFrameTemporary(int slot) {
+    if (slot < 0 || slot >= MAX_TEMP_MAPPINGS || !temp_mappings[slot].active) {
+        return;
+    }
+    
+    int temp_vpn = temp_mappings[slot].vpn;
+    
+    // Restore original mapping
+    kernel_state.region0_ptbr[temp_vpn] = temp_mappings[slot].saved_mapping;
+    
+    // Flush TLB again
+    FlushTLBEntry((void*)(VMEM_0_BASE + (temp_vpn << PAGESHIFT)));
+    
+    temp_mappings[slot].active = 0;
+}
 
 void InitializeMemorySubsystem(unsigned int pmem_size) {
     // Step 1: Calculate total number of physical memory frames
+    kernel_state.total_frames = pmem_size / PAGESIZE;
     
     // Step 2: Allocate bitmap for tracking free or used frames
+    int bitmap_size = (kernel_state.total_frames + 7) / 8;
+    kernel_state.free_frame_bitmap = (unsigned char*)malloc(bitmap_size);
+    if (kernel_state.free_frame_bitmap == NULL) {
+        TracePrintf(0, "Failed to allocate frame bitmap\n");
+        Halt();
+    }
     
     // Step 3: Initialize all frames as free (set as 1)
+    memset(kernel_state.free_frame_bitmap, 0xFF, bitmap_size);
+    kernel_state.used_frames = 0;
     
+    // Reserve low frames (bootloader/hardware reserved)
+    MarkKernelFramesAsUsed();
+
     // Step 4: Build initial page table for Region 0
+    BuildInitialRegion0PageTable();
     
     // Step 5: Set initial kernel heap break pointer
+    kernel_state.kernel_brk = (void*)((GET_ORIG_KERNEL_BRK_PAGE() << PAGESHIFT) + VMEM_0_BASE);
+    
+    InitializeTempMappings();
+
+    TracePrintf(1, "Memory subsystem initialized: %d frames, kernel brk at %p\n",
+                kernel_state.total_frames, kernel_state.kernel_brk);
+}
+
+void MarkKernelFramesAsUsed() {
+    int first_text_pfn = GET_FIRST_KERNEL_TEXT_PAGE();  // e.g., 16
+    for (int pfn = 0; pfn < first_text_pfn; pfn++) {
+        MarkFrameUsed(pfn);  // Sets bit in bitmap, increments used_frames
+    }
+    TracePrintf(1, "Marked %d low PFNs (0–%d) as used (reserved)\n", first_text_pfn, first_text_pfn - 1);
 }
 
 void BuildInitialRegion0PageTable() {
     // Step 1: Allocate memory for Region 0 page table entries
+    kernel_state.region0_ptlr = VMEM_0_SIZE / PAGESIZE;
+    kernel_state.region0_ptbr = (pte_t*)malloc(kernel_state.region0_ptlr * sizeof(pte_t));
+    if (kernel_state.region0_ptbr == NULL) {
+        TracePrintf(0, "Failed to allocate Region 0 page table\n");
+        Halt();
+    }
+    
+    // Get build-provided values from yalnix.h
+    int first_kernel_text_page = GET_FIRST_KERNEL_TEXT_PAGE();
+    int first_kernel_data_page = GET_FIRST_KERNEL_DATA_PAGE(); 
+    int orig_kernel_brk_page = GET_ORIG_KERNEL_BRK_PAGE();
+    
+    TracePrintf(1, "Kernel pages: text=%d, data=%d, brk=%d\n",
+                first_kernel_text_page, first_kernel_data_page, orig_kernel_brk_page);
     
     // Step 2: Initialize all page table entries as invalid
-    
+    for (int vpn = 0; vpn < kernel_state.region0_ptlr; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 0;
+        kernel_state.region0_ptbr[vpn].pfn = 0;
+        kernel_state.region0_ptbr[vpn].prot = 0;
+    }
+
     // Step 3: Create identity mapping for kernel text, data, and heap regions
+    // Map kernel text region (read-only, executable)
+    for (int vpn = first_kernel_text_page; vpn < first_kernel_data_page; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  // Identity mapping
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_EXEC;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel text: VPN %d -> PFN %d (READ|EXEC)\n", vpn, vpn);
+    }
     
+    // Map kernel data/heap region (read-write)
+    for (int vpn = first_kernel_data_page; vpn < orig_kernel_brk_page; vpn++) {
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  // Identity mapping
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel data: VPN %d -> PFN %d (READ|WRITE)\n", vpn, vpn);
+    }
+
     // Step 4: Map kernel virtual pages to same physical frames
+    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
+    int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
+    
+    TracePrintf(1, "Mapping initial kernel stack: VPN [%d, %d)\n", 
+                kernel_stack_vpn, kernel_stack_vpn + kernel_stack_pages);
+    
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        int vpn = kernel_stack_vpn + i;
+        kernel_state.region0_ptbr[vpn].valid = 1;
+        kernel_state.region0_ptbr[vpn].pfn = vpn;  
+        kernel_state.region0_ptbr[vpn].prot = PROT_READ | PROT_WRITE;
+        MarkFrameUsed(vpn);
+        TracePrintf(2, "Mapped kernel stack: VPN %d -> PFN %d (READ|WRITE)\n", vpn, vpn);
+    }
+    
+    // Step 5: set up red zone below kernel stack (unmapped to catch stack overflows)
+    int red_zone_vpn = kernel_stack_vpn - 1;
+    kernel_state.region0_ptbr[red_zone_vpn].valid = 0;
+    TracePrintf(2, "Red zone at VPN %d (unmapped)\n", red_zone_vpn);
+    
+    TracePrintf(1, "Region 0 page table complete:\n");
+    TracePrintf(1, "  - Text:   VPN [%d, %d) -> READ|EXEC\n", 
+                first_kernel_text_page, first_kernel_data_page);
+    TracePrintf(1, "  - Data:   VPN [%d, %d) -> READ|WRITE\n", 
+                first_kernel_data_page, orig_kernel_brk_page);
+    TracePrintf(1, "  - Stack:  VPN [%d, %d) -> READ|WRITE\n",
+                kernel_stack_vpn, kernel_stack_vpn + kernel_stack_pages);
+    
+    TracePrintf(1, "Verifying kernel stack mappings:\n");
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        int vpn = kernel_stack_vpn + i;
+        TracePrintf(1, "  VPN %d: valid=%d, pfn=%d, prot=0x%x\n",
+                   vpn, kernel_state.region0_ptbr[vpn].valid,
+                   kernel_state.region0_ptbr[vpn].pfn,
+                   kernel_state.region0_ptbr[vpn].prot);
+    }
+
+    for (int i = 124; i <= 125; i++) {
+        kernel_state.region0_ptbr[i].valid = 0;
+        TracePrintf(2, "Reserved VPN %d for temporary mappings\n", i);
+    }
 }
 
 pte_t* CreateEmptyPageTable(int num_pages) {
@@ -30,6 +190,11 @@ pte_t* CreateEmptyPageTable(int num_pages) {
     if (page_table == NULL) return NULL;
     
     // Step 2: Initialize all entries as invalid/unmapped
+    for (int i = 0; i < num_pages; i++) {
+        page_table[i].valid = 0;
+        page_table[i].pfn = 0;
+        page_table[i].prot = 0;
+    }
     
     return page_table;
 }
@@ -40,19 +205,43 @@ pte_t* CopyPageTable(pte_t* src, int num_pages) {
     if (dest == NULL) return NULL;
     
     // Step 2: Copy valid mappings from source to destination
-    
+    for (int vpn = 0; vpn < num_pages; vpn++) {
+        if (src[vpn].valid) {
+            // For fork(), we need to copy-on-write or duplicate the frame
+            // For now, implement copy-on-write by marking both pages as read-only
+            dest[vpn].valid = 1;
+            dest[vpn].pfn = src[vpn].pfn;  // Share the same frame
+            dest[vpn].prot = PROT_READ;     // Mark as read-only for CoW
+            
+            // Mark source as read-only too
+            src[vpn].prot = PROT_READ;
+            
+            TracePrintf(2, "Copied mapping: VPN %d -> PFN %d (READ-ONLY for CoW)\n", 
+                        vpn, src[vpn].pfn);
+        }
+    }
     
     return dest;
 }
 
 void MapPage(pte_t* page_table, int vpn, int pfn, int prot) {
     // Set up page table entry with mapping information
+    page_table[vpn].valid = 1;
+    page_table[vpn].pfn = pfn;
+    page_table[vpn].prot = prot;
+    
+    TracePrintf(2, "Mapped VPN %d to PFN %d with prot 0x%x\n", vpn, pfn, prot);
 }
 
 void UnmapPage(pte_t* page_table, int vpn) {
     // Step 1: Check if page is currently mapped
-    
-    // Step 2: If so, clear the page table entry and free the physical frame for reuse
+    if (page_table[vpn].valid) {
+        // Step 2: Clear the page table entry
+        page_table[vpn].valid = 0;
+        page_table[vpn].pfn = 0;
+        page_table[vpn].prot = 0;
+        TracePrintf(2, "Unmapped VPN %d\n", vpn);
+    }
 }
 
 int IsPageMapped(pte_t* page_table, int vpn) {
@@ -63,80 +252,293 @@ int AllocateFrame() {
     // Step 1: Search for first free frame in the bitmap
         // Step 2: Mark frame as used and update counters
         // Return allocated frame number
-    return pfn;
+    for (int pfn = 0; pfn < kernel_state.total_frames; pfn++) {
+        if (IsFrameFree(pfn)) {
+            MarkFrameUsed(pfn);
+            kernel_state.used_frames++;
+            TracePrintf(3, "Allocated frame %d, used: %d/%d\n",
+                       pfn, kernel_state.used_frames, kernel_state.total_frames);
+            return pfn;
+        }
+    }
+    
     // Step 3: No free frames available, then out of memory
+    TracePrintf(0, "No free frames available! Used: %d/%d\n",
+               kernel_state.used_frames, kernel_state.total_frames);
     return ERROR;
 }
 
 void FreeFrame(int pfn) {
-    // Validate frame number and mark as free
+    // Validate frame number
+    if (pfn < 0 || pfn >= kernel_state.total_frames) {
+        TracePrintf(0, "FreeFrame: invalid frame %d\n", pfn);
+        return;
+    }
+    MarkFrameFree(pfn);
+    kernel_state.used_frames--;
+    TracePrintf(3, "Freed frame %d, used: %d/%d\n",
+                pfn, kernel_state.used_frames, kernel_state.total_frames);
 }
 
 // Bitmap operations for frame tracking
 int IsFrameFree(int pfn) {
     
     // Step 1: Calculate byte and bit position in bitmap
+    if (pfn < 0 || pfn >= kernel_state.total_frames) return 0;
+
+    int byte_index = pfn / 8;
+    int bit_index = pfn % 8;
     
     // Step 2: Check if the corresponding bit is set
     return (kernel_state.free_frame_bitmap[byte_index] >> bit_index) & 1;
 }
 
 void MarkFrameUsed(int pfn) {
-    // Step 1: Calculate byte and bit position
+    if (pfn < 0 || pfn >= kernel_state.total_frames) return;
     
-    // Step 2: Clear the bit
+    // Step 1: Calculate byte and bit position
+    int byte_index = pfn / 8;
+    int bit_index = pfn % 8;
+    
+    // Step 2: Clear the bit (0 = used, 1 = free)
+    kernel_state.free_frame_bitmap[byte_index] &= ~(1 << bit_index);
 }
 
 void MarkFrameFree(int pfn) {
+    if (pfn < 0 || pfn >= kernel_state.total_frames) return;
+    
     // Step 1: Calculate byte and bit position
-
-    // Step 2: Set the bit
+    int byte_index = pfn / 8;
+    int bit_index = pfn % 8;
+    
+    // Step 2: Set the bit (1 = free)
+    kernel_state.free_frame_bitmap[byte_index] |= (1 << bit_index);
 }
 
 int* AllocateKernelStackFrames() {
-    // Step 1: Calculate number of frames needed for kernel stack
     int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
     int* frames = (int*)malloc(num_frames * sizeof(int));
     if (frames == NULL) return NULL;
     
-    // Step 2: Allocate physical frames for kernel stack
+    // Allocate and initialize each frame
+    for (int i = 0; i < num_frames; i++) {
+        frames[i] = AllocateFrame();
+        if (frames[i] == ERROR) {
+            // Clean up already allocated frames
+            for (int j = 0; j < i; j++) {
+                FreeFrame(frames[j]);
+            }
+            free(frames);
+            return NULL;
+        }
+        
+        // Initialize the frame to zeros using temporary mapping
+        void* temp_addr = MapFrameTemporary(frames[i], PROT_READ | PROT_WRITE, 0);
+        if (temp_addr != NULL) {
+            memset(temp_addr, 0, PAGESIZE);
+            UnmapFrameTemporary(0);
+        } else {
+            TracePrintf(0, "WARNING: Could not initialize kernel stack frame %d\n", i);
+        }
+    }
     
+    TracePrintf(2, "Allocated kernel stack frames: [%d, %d, %d, ...]\n", 
+               frames[0], frames[1], frames[2]);
+
     return frames;
 }
 
 void FreeKernelStackFrames(int* frames) {
+    if (frames == NULL) return;
+    
     // Step 1: Free all physical frames used by kernel stack
+    int num_frames = KERNEL_STACK_MAXSIZE / PAGESIZE;
+    for (int i = 0; i < num_frames; i++) {
+        if (frames[i] != ERROR) {
+            FreeFrame(frames[i]);
+        }
+    }
     
     // Step 2: Free the frames array itself
     free(frames);
 }
 
+void CopyKernelStack(PCB* src, PCB* dest) {
+    if (dest == NULL || dest->kernel_stack_frames == NULL) {
+        TracePrintf(0, "CopyKernelStack: invalid destination\n");
+        return;
+    }
+
+    int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
+
+    if (src == NULL || src->kernel_stack_frames == NULL) {
+        TracePrintf(2, "CopyKernelStack: capturing current stack for PID %d\n", dest->pid);
+        char* live_stack = (char*)KERNEL_STACK_BASE;
+        for (int i = 0; i < kernel_stack_pages; i++) {
+            int dest_frame = dest->kernel_stack_frames[i];
+            if (dest_frame == ERROR) {
+                continue;
+            }
+
+            void* dest_page = MapFrameTemporary(dest_frame, PROT_READ | PROT_WRITE, 0);
+            if (dest_page == NULL) {
+                TracePrintf(0, "CopyKernelStack: failed to map destination frame %d\n", dest_frame);
+                UnmapFrameTemporary(0);
+                return;
+            }
+
+            memcpy(dest_page, live_stack + (i * PAGESIZE), PAGESIZE);
+            UnmapFrameTemporary(0);
+        }
+        TracePrintf(1, "CopyKernelStack: completed successfully\n");
+        return;
+    }
+
+    TracePrintf(2, "CopyKernelStack: copying from PID %d to PID %d\n", src->pid, dest->pid);
+
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        int src_frame = src->kernel_stack_frames[i];
+        int dest_frame = dest->kernel_stack_frames[i];
+
+        if (src_frame == ERROR || dest_frame == ERROR) {
+            continue;
+        }
+
+        void* src_page = MapFrameTemporary(src_frame, PROT_READ, 0);
+        if (src_page == NULL) {
+            TracePrintf(0, "CopyKernelStack: failed to map source frame %d\n", src_frame);
+            UnmapFrameTemporary(0);
+            return;
+        }
+
+        void* dest_page = MapFrameTemporary(dest_frame, PROT_READ | PROT_WRITE, 1);
+        if (dest_page == NULL) {
+            TracePrintf(0, "CopyKernelStack: failed to map destination frame %d\n", dest_frame);
+            UnmapFrameTemporary(0);
+            UnmapFrameTemporary(1);
+            return;
+        }
+
+        memcpy(dest_page, src_page, PAGESIZE);
+        UnmapFrameTemporary(1);
+        UnmapFrameTemporary(0);
+    }
+
+    TracePrintf(1, "CopyKernelStack: completed successfully\n");
+}
+
 void SwitchKernelStackMapping(PCB* pcb) {
+    if (pcb == NULL) return;
+    
     // Step 1: Calculate kernel stack virtual page number
+    int kernel_stack_vpn = (KERNEL_STACK_BASE - VMEM_0_BASE) >> PAGESHIFT;
+    int kernel_stack_pages = KERNEL_STACK_MAXSIZE / PAGESIZE;
+
+    TracePrintf(2, "SwitchKernelStackMapping: switching to process %d kernel stack\n", pcb->pid);
     
     // Step 2: Map new process's kernel stack frames into kernel page table
-   
-    // Step 3: Flush TLB entries for kernel stack region to avoid stale mappings
+    for (int i = 0; i < kernel_stack_pages; i++) {
+        if (pcb->kernel_stack_frames[i] != ERROR) {
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 1;
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].pfn = pcb->kernel_stack_frames[i];
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].prot = PROT_READ | PROT_WRITE;
+            TracePrintf(3, "  Mapped VPN %d to PFN %d\n", 
+                       kernel_stack_vpn + i, pcb->kernel_stack_frames[i]);
+        } else {
+            kernel_state.region0_ptbr[kernel_stack_vpn + i].valid = 0;
+            TracePrintf(3, "  Unmapped VPN %d (no frame)\n", kernel_stack_vpn + i);
+        }
+    }
+    
+    // Step 3: Flush TLB entries for kernel stack region
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_KSTACK);
+    
+    TracePrintf(2, "SwitchKernelStackMapping: completed for process %d\n", pcb->pid);
+}
+
+void ReleaseRegion1Frames(PCB* pcb) {
+    if (pcb == NULL || pcb->region1_ptbr == NULL) {
+        return;
+    }
+
+    int num_pages = VMEM_1_SIZE / PAGESIZE;
+    for (int vpn = 0; vpn < num_pages; vpn++) {
+        if (pcb->region1_ptbr[vpn].valid) {
+            FreeFrame(pcb->region1_ptbr[vpn].pfn);
+            pcb->region1_ptbr[vpn].valid = 0;
+            pcb->region1_ptbr[vpn].pfn = 0;
+            pcb->region1_ptbr[vpn].prot = 0;
+        }
+    }
+}
+
+int CloneRegion1AddressSpace(PCB* parent, PCB* child) {
+    if (parent == NULL || child == NULL ||
+        parent->region1_ptbr == NULL || child->region1_ptbr == NULL) {
+        return ERROR;
+    }
+
+    int num_pages = VMEM_1_SIZE / PAGESIZE;
+    for (int vpn = 0; vpn < num_pages; vpn++) {
+        if (!parent->region1_ptbr[vpn].valid) {
+            continue;
+        }
+
+        int pfn = AllocateFrame();
+        if (pfn == ERROR) {
+            ReleaseRegion1Frames(child);
+            return ERROR;
+        }
+
+        MapPage(child->region1_ptbr, vpn, pfn, parent->region1_ptbr[vpn].prot);
+
+        void* parent_page = MapFrameTemporary(parent->region1_ptbr[vpn].pfn,
+                                              PROT_READ | PROT_WRITE, 0);
+        void* child_page = MapFrameTemporary(pfn, PROT_READ | PROT_WRITE, 1);
+
+        if (parent_page == NULL || child_page == NULL) {
+            if (parent_page != NULL) {
+                UnmapFrameTemporary(0);
+            }
+            if (child_page != NULL) {
+                UnmapFrameTemporary(1);
+            }
+            ReleaseRegion1Frames(child);
+            return ERROR;
+        }
+
+        memcpy(child_page, parent_page, PAGESIZE);
+
+        UnmapFrameTemporary(0);
+        UnmapFrameTemporary(1);
+    }
+
+    return SUCCESS;
 }
 
 void FlushTLBEntry(void* vaddr) {
-    // Flush single TLB entry for specific virtual address
+    WriteRegister(REG_TLB_FLUSH, (unsigned int)vaddr);
 }
 
 void FlushRegion1TLB() {
-    // Flush all TLB entries for Region 1 (user space)
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_1);
 }
 
 void FlushAllTLB() {
-    // Flush entire TLB
+    WriteRegister(REG_TLB_FLUSH, TLB_FLUSH_ALL);
 }
 
 int HandleMemoryTrap(UserContext* uctxt) {
     PCB* current = kernel_state.current_process;
     void* fault_addr = uctxt->addr;  // Address that caused the fault
+    
     // Step 1: Check if fault occurred in user space (Region 1)
+    if (fault_addr >= (void*)VMEM_1_BASE && fault_addr < (void*)VMEM_1_LIMIT) {
         // Step 2: Check if this is a stack growth fault (access below stack pointer)
-    return GrowUserStack(current, fault_addr);
+        if (fault_addr < current->user_context.sp) {
+            return GrowUserStack(current, fault_addr);
+        }
+    }
     
     // Step 3: Invalid memory access - cannot handle this fault
     TracePrintf(0, "Process %d: invalid memory access at %p (sp=%p)\n",
@@ -146,29 +548,120 @@ int HandleMemoryTrap(UserContext* uctxt) {
 
 int GrowUserStack(PCB* pcb, void* fault_addr) {
     // Step 1: Calculate virtual page number of fault address
-    
-    // Step 2: Check if physical memory is available
-    return ERROR;
-    
-    
-    // Step 3: Check red zone - ensure stack doesn't grow into heap
-    return ERROR;
-    
-    
-    // Step 4: Allocate physical frame and map it to fault address
-    return ERROR;
-    
+    int vpn = ((unsigned int)fault_addr - VMEM_1_BASE) >> PAGESHIFT;
+
+    // Step 2: Ensure growth will not collide with the heap (which grows upward)
+    if ((unsigned long)fault_addr < (unsigned long)pcb->user_heap_break) {
+        TracePrintf(0, "GrowUserStack: stack would grow into heap (fault=%p, brk=%p)\n",
+                    fault_addr, pcb->user_heap_break);
+        return ERROR;
+    }
+
+    // Step 3: Allocate a new physical frame for the stack
+    int pfn = AllocateFrame();
+    if (pfn == ERROR) {
+        TracePrintf(0, "GrowUserStack: no free frames for stack growth\n");
+        return ERROR;
+    }
+
+    // Step 4: Map the new frame into the process's page table
+    MapPage(pcb->region1_ptbr, vpn, pfn, PROT_READ | PROT_WRITE);
+
     // Step 5: Flush TLB entry to ensure new mapping takes effect
+    FlushTLBEntry(fault_addr);
+
+    TracePrintf(1, "Grew user stack for process %d at VPN %d\n", pcb->pid, vpn);
     return SUCCESS;
 }
 
 int GrowUserHeap(PCB* pcb, void* addr) {
-    // Placeholder for user heap growth implementation
-    // Would map pages between current heap break and new address
+    if (pcb == NULL || addr == NULL) return ERROR;
+    
+    // Round up to page boundary
+    void* new_brk = (void*)UP_TO_PAGE(addr);
+    void* current_brk = pcb->user_heap_break;
+    
+    TracePrintf(2, "GrowUserHeap: process %d, current brk %p, new brk %p\n",
+                pcb->pid, current_brk, new_brk);
+    
+    // Check if we're shrinking (not typically allowed)
+    if (new_brk < current_brk) {
+        TracePrintf(0, "GrowUserHeap: attempt to shrink user heap\n");
+        return ERROR;
+    }
+    // Check if new break would collide with stack
+    if (new_brk >= pcb->user_context.sp) {
+        TracePrintf(0, "GrowUserHeap: heap would grow into stack\n");
+        return ERROR;
+    }
+    
+    // Map pages between current break and new break
+    int current_vpn = ((unsigned int)current_brk - VMEM_1_BASE) >> PAGESHIFT;
+    int new_vpn = ((unsigned int)new_brk - VMEM_1_BASE) >> PAGESHIFT;
+    
+    for (int vpn = current_vpn; vpn < new_vpn; vpn++) {
+        int pfn = AllocateFrame();
+        if (pfn == ERROR) {
+            TracePrintf(0, "GrowUserHeap: out of memory at VPN %d\n", vpn);
+            // Clean up any pages we already allocated
+            for (int i = current_vpn; i < vpn; i++) {
+                UnmapPage(pcb->region1_ptbr, i);
+            }
+            return ERROR;
+        }
+        
+        MapPage(pcb->region1_ptbr, vpn, pfn, PROT_READ | PROT_WRITE);
+        TracePrintf(2, "Mapped user heap page: VPN %d -> PFN %d\n", vpn, pfn);
+    }
+    
+    // Update user heap break
+    pcb->user_heap_break = new_brk;
+    
+    // Flush TLB for the new mappings
+    FlushRegion1TLB();
+    
     return SUCCESS;
 }
 
 int GrowKernelHeap(void* addr) {
-    // Placeholder for kernel heap growth implementation
+    if (addr == NULL) return ERROR;
+    
+    // Round up to page boundary
+    void* new_brk = (void*)UP_TO_PAGE(addr);
+    void* current_brk = kernel_state.kernel_brk;
+    
+    TracePrintf(2, "GrowKernelHeap: current brk %p, new brk %p\n",
+                current_brk, new_brk);
+    
+    // Check if we're shrinking (not typically allowed)
+    if (new_brk < current_brk) {
+        TracePrintf(0, "GrowKernelHeap: attempt to shrink kernel heap\n");
+        return ERROR;
+    }
+    
+    // Map pages between current break and new break in Region 0
+    int current_vpn = ((unsigned int)current_brk - VMEM_0_BASE) >> PAGESHIFT;
+    int new_vpn = ((unsigned int)new_brk - VMEM_0_BASE) >> PAGESHIFT;
+    
+    for (int vpn = current_vpn; vpn < new_vpn; vpn++) {
+        int pfn = AllocateFrame();
+        if (pfn == ERROR) {
+            TracePrintf(0, "GrowKernelHeap: out of memory at VPN %d\n", vpn);
+            // Clean up any pages we already allocated
+            for (int i = current_vpn; i < vpn; i++) {
+                UnmapPage(kernel_state.region0_ptbr, i);
+            }
+            return ERROR;
+        }
+        
+        MapPage(kernel_state.region0_ptbr, vpn, pfn, PROT_READ | PROT_WRITE);
+        TracePrintf(2, "Mapped kernel heap page: VPN %d -> PFN %d\n", vpn, pfn);
+    }
+    
+    // Update kernel heap break
+    kernel_state.kernel_brk = new_brk;
+    
     return SUCCESS;
 }
+
+
